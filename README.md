@@ -6,7 +6,7 @@
 
 ## 当前状态
 
-已将原 Python 模拟引擎改造为逐次提交动作的牌局引擎，并保留本地演示脚本。前端、后端网络接口、数据库及部署目录目前为占位，尚未实现网络对局。
+已将原 Python 模拟引擎改造为逐次提交动作的牌局引擎，并加入 SQLite 持久化、房间买入上限、买入与手牌记录。前端、后端网络接口及部署目录目前为占位，尚未实现网络对局。
 
 ## 目录职责
 
@@ -60,6 +60,7 @@ python -B -X utf8 -m backend.examples.simulate_hand
 
 ```powershell
 D:\miniconda\envs\Texas_Holdem\python.exe -B -X utf8 -m unittest discover -s backend/tests/engine -v
+D:\miniconda\envs\Texas_Holdem\python.exe -B -X utf8 -m unittest discover -s backend/tests/integration -v
 ```
 
 ## 使用引擎
@@ -81,6 +82,18 @@ private_snapshot = game.export_private_snapshot()  # 只供服务端持久化
 
 `private_snapshot` 包含全部底牌和剩余牌堆，绝不能发送给玩家。房间服务必须串行处理同一桌的命令，并将操作结果与快照一起持久化。行动截止时间由房间服务设置和执行，引擎负责保存该时间。
 
+## 数据库
+
+`PokerStore` 位于 `backend/app/services/storage.py`，负责创建房间、发放玩家凭证、逐笔买入、开始手牌、提交动作、恢复快照及查询个人历史。数据库结构和一致性规则见 [数据库说明](docs/database.md)。房间的买入上限限制买入**之后**的在桌筹码；获胜筹码可以超过上限。
+
+初始化本地数据库：
+
+```powershell
+D:\miniconda\envs\Texas_Holdem\python.exe -B -X utf8 -m backend.examples.init_database
+```
+
+默认生成 `database/holdem.sqlite3`，该文件在 `.gitignore` 中，不会被提交。数据库迁移脚本会随代码进入 Git。
+
 ## 下一步
 
-建立数据库模型与迁移，保存牌局、玩家身份、买入、动作、结算与私密快照。详细顺序见 [开发计划](docs/development-plan.md)，已确认范围见 [需求说明](docs/requirements.md)。
+建立管理员验证、邀请与玩家 Cookie 会话接口，再接入实时通信和网页牌桌。详细顺序见 [开发计划](docs/development-plan.md)，已确认范围见 [需求说明](docs/requirements.md)。
