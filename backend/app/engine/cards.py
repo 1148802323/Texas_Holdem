@@ -65,3 +65,14 @@ class Card:
     def code(self) -> str:
         # 例如：As, Td
         return f"{self.rank.label}{self.suit.short}"
+
+    @classmethod
+    def from_code(cls, code: str) -> Card:
+        if len(code) != 2:
+            raise ValueError("Invalid card code")
+        ranks = {rank.label: rank for rank in Rank}
+        suits = {suit.short: suit for suit in Suit}
+        try:
+            return cls(ranks[code[0]], suits[code[1]])
+        except KeyError as exc:
+            raise ValueError("Invalid card code") from exc

@@ -27,6 +27,7 @@ class ActionRecord:
     to_call: int
     pot_after: int
     current_bet: int
+    paid: int = 0  # chips actually moved by this action
 
 
 @dataclass(frozen=True, slots=True)

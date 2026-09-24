@@ -1,12 +1,13 @@
 from __future__ import annotations
 import random
+import secrets
 from typing import List
 from .cards import Card, Rank, Suit
 
 
 class Deck:
     def __init__(self, seed: int | None = None) -> None:
-        self._rng = random.Random(seed)
+        self._rng = random.Random(seed) if seed is not None else secrets.SystemRandom()
         self._cards: List[Card] = [Card(r, s) for s in Suit for r in Rank]
         self.shuffle()
 
@@ -21,6 +22,8 @@ class Deck:
             raise ValueError("n must be >= 0")
         if n > len(self._cards):
             raise ValueError("Not enough cards in deck")
+        if n == 0:
+            return []
         out = self._cards[-n:]
         del self._cards[-n:]
         return out

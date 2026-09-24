@@ -1,6 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List
+from uuid import uuid4
 from .cards import Card
 
 
@@ -8,6 +9,7 @@ from .cards import Card
 class Player:
     name: str
     stack: int = 0
+    player_id: str = field(default_factory=lambda: uuid4().hex)
     hole: List[Card] = field(default_factory=list)
     folded: bool = False
     all_in: bool = False
