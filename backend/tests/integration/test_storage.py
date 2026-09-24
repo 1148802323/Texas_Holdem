@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -181,6 +182,43 @@ class StorageTests(unittest.TestCase):
             count = conn.execute("SELECT COUNT(*) FROM hand_actions WHERE hand_id = ?",
                                  (hand["hand_id"],)).fetchone()[0]
         self.assertEqual(count, 8)
+
+    def test_timeout_folds_when_facing_bet_and_checks_when_free(self):
+        room_id, alice, bob = self.room(first=100, second=100)
+        first_hand = self.store.start_hand(room_id, "timeout-fold", deadline_seconds=30)
+        self.store.set_deadline(room_id, first_hand["hand_id"], time.time() - 1,
+                                first_hand["version"])
+        self.assertEqual(self.store.expire_due_actions(), [room_id])
+        self.assertEqual(self.store.load_game(room_id).street, "complete")
+        self.assertEqual(self.store.load_game(room_id).history[-1].action, "fold")
+        self.assertEqual(self.store.expire_due_actions(), [])
+
+        second_hand = self.store.start_hand(room_id, "timeout-check", deadline_seconds=30)
+        actor = self.store.load_game(room_id).players[self.store.load_game(room_id).to_act_index]
+        actor_token = alice.session_token if actor.player_id == alice.player_id else bob.session_token
+        self.store.apply_action(room_id, second_hand["hand_id"], actor_token,
+                                Action(ActionType.CALL), second_hand["version"], "call-before-check",
+                                deadline_seconds=30)
+        game = self.store.load_game(room_id)
+        self.assertEqual(game.legal_actions(game.players[game.to_act_index].player_id).to_call, 0)
+        self.store.set_deadline(room_id, second_hand["hand_id"], time.time() - 1,
+                                game.version)
+        self.assertEqual(self.store.expire_due_actions(), [room_id])
+        game = self.store.load_game(room_id)
+        self.assertEqual(game.history[-1].action, "check")
+        self.assertEqual(game.street, "flop")
+        self.assertGreater(game.deadline_at, time.time())
+
+    def test_restart_arms_a_legacy_hand_without_deadline(self):
+        room_id, _, _ = self.room(first=100, second=100)
+        hand = self.store.start_hand(room_id, "old-snapshot")
+        self.assertIsNone(self.store.load_game(room_id).deadline_at)
+        restarted = PokerStore(self.path)
+        self.assertEqual(restarted.arm_missing_deadlines(), [room_id])
+        self.assertEqual(restarted.arm_missing_deadlines(), [])
+        game = restarted.load_game(room_id)
+        self.assertEqual(game.version, hand["version"] + 1)
+        self.assertGreater(game.deadline_at, time.time())
 
 
 if __name__ == "__main__":

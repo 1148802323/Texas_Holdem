@@ -6,7 +6,9 @@
 
 ## 当前状态
 
-已将原 Python 模拟引擎改造为逐次提交动作的牌局引擎，并加入 SQLite 持久化、房间买入上限、买入与手牌记录。前端、后端网络接口及部署目录目前为占位，尚未实现网络对局。
+已具备逐次操作的规则引擎、SQLite 持久化、管理员建房、邀请入座、浏览器牌桌和 WebSocket 同步。当前可在本机运行；公网部署与部分管理功能仍待完成。
+
+**运行网页牌桌：**按 [网页运行说明](docs/web.md) 设置管理员密码并启动服务，访问 `http://127.0.0.1:8000/admin`。
 
 ## 目录职责
 
@@ -96,4 +98,4 @@ D:\miniconda\envs\Texas_Holdem\python.exe -B -X utf8 -m backend.examples.init_da
 
 ## 下一步
 
-建立管理员验证、邀请与玩家 Cookie 会话接口，再接入实时通信和网页牌桌。详细顺序见 [开发计划](docs/development-plan.md)，已确认范围见 [需求说明](docs/requirements.md)。
+完善管理员操作、跨设备恢复与公网部署。详细顺序见 [开发计划](docs/development-plan.md)，已确认范围见 [需求说明](docs/requirements.md)。

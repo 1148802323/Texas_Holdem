@@ -384,6 +384,7 @@ class HoldemGame:
         """Only this JSON-safe view is suitable for a player-facing API."""
         seat = self._seat(player_id)
         return {
+            "viewer_player_id": player_id,
             "hand_id": self.hand_id, "hand_number": self.hand_number,
             "version": self.version, "street": self.street,
             "button_index": self.button_index, "to_act_index": self.to_act_index,

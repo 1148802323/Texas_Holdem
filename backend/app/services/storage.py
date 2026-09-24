@@ -10,6 +10,7 @@ import hashlib
 import json
 import secrets
 import sqlite3
+import time
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -232,7 +233,8 @@ class PokerStore:
             )
             return entry
 
-    def start_hand(self, room_id: str, request_id: str) -> dict:
+    def start_hand(self, room_id: str, request_id: str,
+                   deadline_seconds: int | None = None) -> dict:
         _request_id(request_id)
         with self._transaction() as conn:
             room = self._room(conn, room_id)
@@ -268,6 +270,8 @@ class PokerStore:
                 game.hand_number = number - 1
                 game.button_index = (next_button_index - 1) % len(rows)
             game.start_new_hand()
+            if game.street != "complete" and deadline_seconds is not None:
+                game.set_deadline(time.time() + deadline_seconds)
             button_seat = rows[game.button_index]["seat"]
             small_blind_index, big_blind_index = game._blinds()
             conn.execute(
@@ -307,7 +311,8 @@ class PokerStore:
             )
 
     def apply_action(self, room_id: str, hand_id: str, token: str, action: Action,
-                     expected_version: int, request_id: str) -> dict:
+                     expected_version: int, request_id: str,
+                     deadline_seconds: int | None = None) -> dict:
         _request_id(request_id)
         if type(expected_version) is not int:
             raise ValueError("expected_version must be an integer")
@@ -336,26 +341,84 @@ class PokerStore:
                 raise Conflict("Hand is not active")
             game = HoldemGame.from_private_snapshot(json.loads(hand["private_snapshot"]))
             game.submit_action(player["id"], action, expected_version)
-            record = game.history[-1]
-            conn.execute(
-                "INSERT INTO hand_actions(id, hand_id, player_id, request_id, sequence, "
-                "street, action, amount, paid, to_call, pot_after, version_after, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (_new_id(), hand_id, player["id"], request_id, len(game.history),
-                 record.street, record.action, record.amount, record.paid,
-                 record.to_call, record.pot_after, game.version, _now()),
-            )
-            completed = game.street == "complete"
-            conn.execute(
-                "UPDATE hands SET status = ?, version = ?, private_snapshot = ?, "
-                "completed_at = ? WHERE id = ?",
-                ("complete" if completed else "active", game.version,
-                 _json(game.export_private_snapshot()), _now() if completed else None, hand_id),
-            )
-            if completed:
-                self._save_settlement(conn, game)
+            self._persist_action(conn, hand_id, player["id"], request_id,
+                                 game, deadline_seconds)
             return {"hand_id": hand_id, "version": game.version,
                     "status": game.street, "replayed": False}
+
+    def _persist_action(self, conn: sqlite3.Connection, hand_id: str, player_id: str,
+                        request_id: str, game: HoldemGame,
+                        deadline_seconds: int | None) -> None:
+        if game.street != "complete" and deadline_seconds is not None:
+            game.set_deadline(time.time() + deadline_seconds)
+        record = game.history[-1]
+        conn.execute(
+            "INSERT INTO hand_actions(id, hand_id, player_id, request_id, sequence, "
+            "street, action, amount, paid, to_call, pot_after, version_after, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (_new_id(), hand_id, player_id, request_id, len(game.history),
+             record.street, record.action, record.amount, record.paid,
+             record.to_call, record.pot_after, game.version, _now()),
+        )
+        completed = game.street == "complete"
+        conn.execute(
+            "UPDATE hands SET status = ?, version = ?, private_snapshot = ?, "
+            "completed_at = ? WHERE id = ?",
+            ("complete" if completed else "active", game.version,
+             _json(game.export_private_snapshot()), _now() if completed else None, hand_id),
+        )
+        if completed:
+            self._save_settlement(conn, game)
+
+    def expire_due_actions(self, now: float | None = None,
+                           deadline_seconds: int = 30) -> list[str]:
+        """Trusted scheduler: check if possible, otherwise fold, then persist."""
+        now = time.time() if now is None else now
+        with closing(self._connect()) as conn:
+            due_candidates = [row["id"] for row in conn.execute(
+                "SELECT id FROM hands WHERE status = 'active'"
+            )]
+        changed_rooms: list[str] = []
+        for hand_id in due_candidates:
+            with self._transaction() as conn:
+                hand = conn.execute("SELECT * FROM hands WHERE id = ?", (hand_id,)).fetchone()
+                if hand is None or hand["status"] != "active":
+                    continue
+                game = HoldemGame.from_private_snapshot(json.loads(hand["private_snapshot"]))
+                if game.deadline_at is None or game.deadline_at > now or game.to_act_index is None:
+                    continue
+                actor = game.players[game.to_act_index]
+                legal = game.legal_actions(actor.player_id)
+                action = Action(ActionType.CHECK if legal.can_check else ActionType.FOLD)
+                old_version = game.version
+                game.submit_action(actor.player_id, action, old_version)
+                self._persist_action(conn, hand_id, actor.player_id,
+                                     f"auto-timeout-{old_version}", game, deadline_seconds)
+                changed_rooms.append(hand["room_id"])
+        return changed_rooms
+
+    def arm_missing_deadlines(self, deadline_seconds: int = 30) -> list[str]:
+        """Give older active snapshots a deadline when the server starts."""
+        with closing(self._connect()) as conn:
+            hand_ids = [row["id"] for row in conn.execute(
+                "SELECT id FROM hands WHERE status = 'active'"
+            )]
+        changed_rooms: list[str] = []
+        for hand_id in hand_ids:
+            with self._transaction() as conn:
+                hand = conn.execute("SELECT * FROM hands WHERE id = ?", (hand_id,)).fetchone()
+                if hand is None or hand["status"] != "active":
+                    continue
+                game = HoldemGame.from_private_snapshot(json.loads(hand["private_snapshot"]))
+                if game.deadline_at is not None or game.to_act_index is None:
+                    continue
+                game.set_deadline(time.time() + deadline_seconds)
+                conn.execute(
+                    "UPDATE hands SET version = ?, private_snapshot = ? WHERE id = ?",
+                    (game.version, _json(game.export_private_snapshot()), hand_id),
+                )
+                changed_rooms.append(hand["room_id"])
+        return changed_rooms
 
     def set_deadline(self, room_id: str, hand_id: str, deadline_at: float | None,
                      expected_version: int) -> int:
@@ -423,6 +486,33 @@ class PokerStore:
                 "latest_hand_status": last["status"] if last else None,
                 "players": players,
             }
+
+    def list_rooms(self) -> list[dict]:
+        """Trusted administrator list; authentication belongs in the HTTP layer."""
+        with closing(self._connect()) as conn:
+            return [
+                {"room_id": row["id"], "small_blind": row["small_blind"],
+                 "big_blind": row["big_blind"], "max_players": row["max_players"],
+                 "max_buyin_stack": row["max_buyin_stack"], "status": row["status"],
+                 "created_at": row["created_at"]}
+                for row in conn.execute("SELECT * FROM rooms ORDER BY created_at DESC")
+            ]
+
+    def public_room(self, room_id: str) -> dict:
+        """Room information suitable for anyone holding its invite link."""
+        overview = self.room_overview(room_id)
+        return {
+            key: overview[key] for key in (
+                "room_id", "small_blind", "big_blind", "max_players",
+                "max_buyin_stack", "nickname_policy", "allowed_nicknames",
+                "status", "latest_hand_id", "latest_hand_status"
+            )
+        } | {
+            "players": [
+                {"nickname": p["nickname"], "seat": p["seat"], "stack": p["stack"]}
+                for p in overview["players"]
+            ]
+        }
 
     def player_view(self, room_id: str, token: str, hand_id: str | None = None) -> dict:
         with closing(self._connect()) as conn:
