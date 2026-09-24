@@ -21,7 +21,6 @@ from ..engine.actions import Action, ActionType
 from ..engine.game import InvalidAction
 from ..services.storage import AccessDenied, Conflict, PokerStore, StoreError
 
-
 ROOT = Path(__file__).resolve().parents[3]
 FRONTEND = ROOT / "frontend"
 ACTION_SECONDS = 30
@@ -42,6 +41,10 @@ class RoomBody(BaseModel):
 
 class JoinBody(BaseModel):
     nickname: StrictStr
+    seat: StrictInt | None = None
+
+
+class SeatBody(BaseModel):
     seat: StrictInt
 
 
@@ -93,9 +96,11 @@ def create_app(db_path: str | Path | None = None, admin_password: str | None = N
     store.initialize()
     hub = RoomHub(store)
     login_failures: dict[str, list[float]] = {}
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         await asyncio.to_thread(store.arm_missing_deadlines, ACTION_SECONDS)
+
         async def timeout_loop():
             while True:
                 try:
@@ -234,13 +239,35 @@ def create_app(db_path: str | Path | None = None, admin_password: str | None = N
             except AccessDenied:
                 pass
             else:
-                raise Conflict("This browser is already seated in this room")
+                raise Conflict("This browser has already joined this room")
         access = await asyncio.to_thread(store.join_player, room_id, body.nickname, body.seat)
         response.set_cookie(f"th_room_{room_id}", access.session_token,
                             httponly=True, secure=request.url.scheme == "https",
                             samesite="lax", path="/")
         await hub.broadcast(room_id)
         return {"player_id": access.player_id, "nickname": access.nickname, "seat": access.seat}
+
+    @app.post("/api/rooms/{room_id}/seat")
+    async def take_seat(room_id: str, body: SeatBody, request: Request):
+        result = await asyncio.to_thread(store.take_seat, room_id,
+                                         player_token(request, room_id), body.seat)
+        await hub.broadcast(room_id)
+        return result
+
+    @app.post("/api/rooms/{room_id}/stand")
+    async def stand_up(room_id: str, request: Request):
+        result = await asyncio.to_thread(store.stand_up, room_id,
+                                         player_token(request, room_id))
+        await hub.broadcast(room_id)
+        return result
+
+    @app.post("/api/rooms/{room_id}/leave")
+    async def leave_room(room_id: str, request: Request, response: Response):
+        result = await asyncio.to_thread(store.leave_room, room_id,
+                                         player_token(request, room_id))
+        response.delete_cookie(f"th_room_{room_id}", path="/")
+        await hub.broadcast(room_id)
+        return result
 
     @app.get("/api/rooms/{room_id}/state")
     async def state(room_id: str, request: Request):

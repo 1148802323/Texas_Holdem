@@ -116,6 +116,50 @@ class BrowserApiTests(unittest.TestCase):
         self.assertEqual(public["players"][0]["nickname"], "Alice")
         self.assertNotIn("session_token_hash", json.dumps(public))
 
+    def test_spectator_can_sit_watch_and_leave_after_hand(self):
+        room_id = self.create_room()
+        cookie_name = f"th_room_{room_id}"
+        join = self.client.post(f"/api/rooms/{room_id}/join", json={"nickname": "Alice"})
+        self.assertEqual(join.status_code, 200)
+        self.assertIsNone(join.json()["seat"])
+        alice_cookie = self.client.cookies.get(cookie_name)
+        self.assertEqual(self.client.post(f"/api/rooms/{room_id}/buyins",
+                         json={"amount": 100, "request_id": "before-seat"}).status_code, 409)
+        self.assertEqual(self.client.post(f"/api/rooms/{room_id}/seat", json={"seat": 0}).status_code, 200)
+        self.assertEqual(self.client.post(f"/api/rooms/{room_id}/buyins",
+                         json={"amount": 100, "request_id": "alice-buy"}).status_code, 200)
+        self.client.cookies.delete(cookie_name)
+        self.client.post(f"/api/rooms/{room_id}/join", json={"nickname": "Bob", "seat": 1})
+        bob_cookie = self.client.cookies.get(cookie_name)
+        self.client.post(f"/api/rooms/{room_id}/buyins",
+                         json={"amount": 100, "request_id": "bob-buy"})
+        started = self.client.post(f"/api/admin/rooms/{room_id}/hands",
+                                   json={"request_id": "start"}).json()
+        self.client.cookies.delete(cookie_name)
+        self.client.post(f"/api/rooms/{room_id}/join", json={"nickname": "Carol"})
+        with self.client.websocket_connect(f"/ws/rooms/{room_id}") as socket:
+            view = socket.receive_json()["game"]
+            self.assertEqual(view["status"], "watching")
+            self.assertEqual(len(view["players"]), 2)
+            self.assertTrue(all(p["hole"] is None for p in view["players"]))
+            self.assertNotIn("deck", json.dumps(view))
+        self.client.cookies.set(cookie_name, alice_cookie)
+        for endpoint, body in (("seat", {"seat": 1}), ("stand", None), ("leave", None)):
+            self.assertEqual(self.client.post(f"/api/rooms/{room_id}/{endpoint}",
+                             json=body).status_code, 409)
+        self.client.post(f"/api/rooms/{room_id}/hands/{started['hand_id']}/actions",
+                         json={"action": "fold", "amount": 0,
+                               "expected_version": started["version"], "request_id": "fold"})
+        self.assertEqual(self.client.post(f"/api/rooms/{room_id}/stand").json()["stack"], 99)
+        self.assertEqual(self.client.post(f"/api/rooms/{room_id}/seat", json={"seat": 0}).json()["stack"], 99)
+        leave = self.client.post(f"/api/rooms/{room_id}/leave")
+        self.assertEqual(leave.json()["cashout"], 99)
+        self.assertEqual(self.client.get(f"/api/rooms/{room_id}/state").status_code, 401)
+        self.assertEqual(self.client.get(f"/api/rooms/{room_id}/history").status_code, 401)
+        leaderboard = self.client.get(f"/api/rooms/{room_id}").json()["leaderboard"]
+        self.assertEqual(next(p["profit_loss"] for p in leaderboard if p["nickname"] == "Alice"), -1)
+        self.assertNotEqual(bob_cookie, alice_cookie)
+
 
 if __name__ == "__main__":
     unittest.main()

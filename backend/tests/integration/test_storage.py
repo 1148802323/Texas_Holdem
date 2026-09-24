@@ -35,7 +35,7 @@ class StorageTests(unittest.TestCase):
     def test_schema_identity_and_unique_seats(self):
         room_id, alice, bob = self.room()
         with closing(sqlite3.connect(self.path)) as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
             stored = conn.execute("SELECT session_token_hash FROM room_players WHERE id = ?",
                                   (alice.player_id,)).fetchone()[0]
         self.assertNotEqual(stored, alice.session_token)
@@ -143,8 +143,9 @@ class StorageTests(unittest.TestCase):
         hand = self.store.start_hand(room_id, "start")
         carol = self.store.join_player(room_id, "Carol", 2)
         view = self.store.player_view(room_id, carol.session_token)
-        self.assertEqual(view["status"], "waiting_next_hand")
-        self.assertNotIn("hole", json.dumps(view))
+        self.assertEqual(view["status"], "watching")
+        self.assertTrue(all(p["hole"] is None for p in view["players"]))
+        self.assertNotIn("deck", json.dumps(view))
         with self.assertRaises(AccessDenied):
             self.store.player_view(room_id, carol.session_token, hand["hand_id"])
 
@@ -219,6 +220,75 @@ class StorageTests(unittest.TestCase):
         game = restarted.load_game(room_id)
         self.assertEqual(game.version, hand["version"] + 1)
         self.assertGreater(game.deadline_at, time.time())
+
+    def test_spectator_seat_changes_and_logout_keep_chips_with_nickname(self):
+        room_id = self.store.create_room(1, 2, 3, 2000)
+        alice = self.store.join_player(room_id, "Alice")
+        bob = self.store.join_player(room_id, "Bob")
+        self.assertIsNone(alice.seat)
+        self.assertEqual(len(self.store.public_room(room_id)["players"]), 2)
+        with self.assertRaises(Conflict):
+            self.store.buy_in(room_id, alice.session_token, 100, "unseated")
+        self.store.take_seat(room_id, alice.session_token, 0)
+        self.store.take_seat(room_id, bob.session_token, 1)
+        with self.assertRaises(Conflict):
+            self.store.take_seat(room_id, bob.session_token, 0)
+        self.store.buy_in(room_id, alice.session_token, 100, "alice-buy")
+        self.store.buy_in(room_id, bob.session_token, 100, "bob-buy")
+        hand = self.store.start_hand(room_id, "first")
+        for operation in (
+            lambda: self.store.take_seat(room_id, alice.session_token, 2),
+            lambda: self.store.stand_up(room_id, alice.session_token),
+            lambda: self.store.leave_room(room_id, alice.session_token),
+        ):
+            with self.assertRaises(Conflict):
+                operation()
+        carol = self.store.join_player(room_id, "Carol")
+        spectator = self.store.player_view(room_id, carol.session_token)
+        self.assertEqual(spectator["status"], "watching")
+        self.assertIsNone(spectator["legal_actions"])
+        self.assertTrue(all(p["hole"] is None for p in spectator["players"]))
+        self.assertNotIn("deck", json.dumps(spectator))
+        self.store.take_seat(room_id, carol.session_token, 2)
+        self.assertEqual(self.store.player_view(room_id, carol.session_token)["status"], "watching")
+        self.store.apply_action(room_id, hand["hand_id"], alice.session_token,
+                                Action(ActionType.FOLD), hand["version"], "alice-fold")
+        self.assertEqual(self.store.stand_up(room_id, alice.session_token)["stack"], 99)
+        with self.assertRaises(Conflict):
+            self.store.buy_in(room_id, alice.session_token, 1, "standing-buy")
+        self.assertEqual(self.store.take_seat(room_id, alice.session_token, 0)["stack"], 99)
+        self.assertEqual(self.store.leave_room(room_id, alice.session_token)["cashout"], 99)
+        with self.assertRaises(AccessDenied):
+            self.store.player_view(room_id, alice.session_token)
+        self.assertEqual(next(p for p in self.store.public_room(room_id)["leaderboard"]
+                              if p["nickname"] == "Alice")["profit_loss"], -1)
+        self.assertNotIn("Alice", [p["nickname"] for p in self.store.public_room(room_id)["players"]])
+        new_alice = self.store.join_player(room_id, "Alice")
+        self.assertNotEqual(new_alice.player_id, alice.player_id)
+        self.assertEqual(self.store.hand_history(room_id, new_alice.session_token), [])
+
+    def test_migrates_v1_database_without_losing_player_references(self):
+        self.path.unlink()
+        migration = Path("database/migrations/001_initial.sql").read_text(encoding="utf-8")
+        with closing(sqlite3.connect(self.path)) as conn:
+            conn.executescript(migration)
+            conn.execute("INSERT INTO rooms(id, small_blind, big_blind, max_players, "
+                         "max_buyin_stack, created_at) VALUES ('r', 1, 2, 2, 2000, 'now')")
+            conn.execute("INSERT INTO room_players(id, room_id, nickname, nickname_key, "
+                         "seat, session_token_hash, stack, total_buyin, created_at) "
+                         "VALUES ('p', 'r', 'Alice', 'alice', 0, 'hash', 100, 100, 'now')")
+            conn.execute("INSERT INTO hands(id, room_id, hand_number, start_request_id, "
+                         "button_seat, status, version, private_snapshot, started_at) "
+                         "VALUES ('h', 'r', 1, 'request', 0, 'complete', 0, '{}', 'now')")
+            conn.execute("INSERT INTO hand_players(hand_id, player_id, seat, starting_stack) "
+                         "VALUES ('h', 'p', 0, 100)")
+            conn.commit()
+        self.store.initialize()
+        with closing(sqlite3.connect(self.path)) as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+            self.assertEqual(conn.execute("SELECT player_id FROM hand_players").fetchone()[0], "p")
+            self.assertEqual(conn.execute("SELECT seat FROM room_players WHERE id = 'p'").fetchone()[0], 0)
 
 
 if __name__ == "__main__":

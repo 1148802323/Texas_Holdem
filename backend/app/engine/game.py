@@ -383,6 +383,13 @@ class HoldemGame:
     def state_for_player(self, player_id: str) -> dict:
         """Only this JSON-safe view is suitable for a player-facing API."""
         seat = self._seat(player_id)
+        return self._visible_state(player_id, seat)
+
+    def state_for_observer(self, player_id: str) -> dict:
+        """Public hand information, with no private hole cards or actions."""
+        return self._visible_state(player_id, None)
+
+    def _visible_state(self, player_id: str, seat: int | None) -> dict:
         return {
             "viewer_player_id": player_id,
             "hand_id": self.hand_id, "hand_number": self.hand_number,
@@ -395,14 +402,14 @@ class HoldemGame:
                 {"player_id": p.player_id, "name": p.name, "seat": i,
                  "stack": p.stack, "bet_this_street": self.bet_this_street[i],
                  "folded": p.folded, "all_in": p.all_in,
-                 "hole": [c.code() for c in p.hole] if i == seat or
+                 "hole": [c.code() for c in p.hole] if (seat is not None and i == seat) or
                  (self.street == "complete" and i in self.showdown) else None}
                 for i, p in enumerate(self.players)
             ],
             "history": [asdict(record) for record in self.history],
             "payouts": self.payouts[:] if self.street == "complete" else None,
             "refunds": self.refunds[:] if self.street == "complete" else None,
-            "legal_actions": asdict(self.legal_actions(player_id)) if self.to_act_index == seat else None,
+            "legal_actions": asdict(self.legal_actions(player_id)) if seat is not None and self.to_act_index == seat else None,
         }
 
     def export_private_snapshot(self) -> dict:

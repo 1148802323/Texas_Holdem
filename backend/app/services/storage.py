@@ -39,7 +39,7 @@ class PlayerAccess:
     player_id: str
     room_id: str
     nickname: str
-    seat: int
+    seat: int | None
     session_token: str  # Returned only once; persist in an HttpOnly cookie.
 
 
@@ -93,7 +93,14 @@ class PokerStore:
                 migration = (Path(__file__).resolve().parents[3] /
                              "database/migrations/001_initial.sql")
                 conn.executescript(migration.read_text(encoding="utf-8"))
-            elif version != 1:
+                version = 1
+            if version == 1:
+                migration = (Path(__file__).resolve().parents[3] /
+                             "database/migrations/002_observers.sql")
+                conn.executescript(migration.read_text(encoding="utf-8"))
+                if conn.execute("PRAGMA foreign_key_check").fetchone():
+                    raise RuntimeError("Observer migration left invalid foreign keys")
+            elif version != 2:
                 raise RuntimeError(f"Unsupported database schema version: {version}")
 
     @staticmethod
@@ -109,7 +116,7 @@ class PokerStore:
             raise AccessDenied("Missing player token")
         digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
         player = conn.execute(
-            "SELECT * FROM room_players WHERE room_id = ? AND session_token_hash = ?",
+            "SELECT * FROM room_players WHERE room_id = ? AND session_token_hash = ? AND is_active = 1",
             (room_id, digest),
         ).fetchone()
         if player is None:
@@ -133,8 +140,8 @@ class PokerStore:
             raise ValueError("Invalid blinds, table size, or buy-in stack limit")
         names: dict[str, str] = {}
         if allowed_nicknames is not None:
-            if not isinstance(allowed_nicknames, list) or not 1 <= len(allowed_nicknames) <= max_players:
-                raise ValueError("Preset nicknames must fit the table")
+            if not isinstance(allowed_nicknames, list) or not 1 <= len(allowed_nicknames) <= 100:
+                raise ValueError("Preset nickname list must have 1 to 100 names")
             for raw_name in allowed_nicknames:
                 if not isinstance(raw_name, str) or not 1 <= len(raw_name.strip()) <= 32:
                     raise ValueError("Invalid preset nickname")
@@ -157,13 +164,13 @@ class PokerStore:
                 )
         return room_id
 
-    def join_player(self, room_id: str, nickname: str, seat: int) -> PlayerAccess:
+    def join_player(self, room_id: str, nickname: str, seat: int | None = None) -> PlayerAccess:
         if not isinstance(nickname, str):
             raise ValueError("Nickname must be text")
         name = nickname.strip()
         if not 1 <= len(name) <= 32:
             raise ValueError("Nickname must have 1 to 32 characters")
-        if type(seat) is not int:
+        if seat is not None and type(seat) is not int:
             raise ValueError("Seat must be an integer")
         token = secrets.token_urlsafe(32)
         player_id = _new_id()
@@ -171,7 +178,7 @@ class PokerStore:
             room = self._room(conn, room_id)
             if room["status"] != "open":
                 raise Conflict("Room is closed")
-            if not 0 <= seat < room["max_players"]:
+            if seat is not None and not 0 <= seat < room["max_players"]:
                 raise ValueError("Seat is outside the table")
             if room["nickname_policy"] == "preset":
                 approved = conn.execute(
@@ -192,6 +199,52 @@ class PokerStore:
                 raise Conflict("Nickname or seat is already occupied") from exc
         return PlayerAccess(player_id, room_id, name, seat, token)
 
+    @staticmethod
+    def _require_not_in_hand(conn: sqlite3.Connection, room_id: str, player_id: str) -> None:
+        hand = PokerStore._latest_hand(conn, room_id)
+        if hand and hand["status"] == "active" and conn.execute(
+            "SELECT 1 FROM hand_players WHERE hand_id = ? AND player_id = ?",
+            (hand["id"], player_id),
+        ).fetchone():
+            raise Conflict("Finish the current hand before changing seats or leaving")
+
+    def take_seat(self, room_id: str, token: str, seat: int) -> dict:
+        if type(seat) is not int:
+            raise ValueError("Seat must be an integer")
+        with self._transaction() as conn:
+            room = self._room(conn, room_id)
+            player = self._player(conn, room_id, token)
+            if room["status"] != "open":
+                raise Conflict("Room is closed")
+            if not 0 <= seat < room["max_players"]:
+                raise ValueError("Seat is outside the table")
+            if player["seat"] == seat:
+                return {"seat": seat, "stack": player["stack"]}
+            self._require_not_in_hand(conn, room_id, player["id"])
+            try:
+                conn.execute("UPDATE room_players SET seat = ? WHERE id = ?", (seat, player["id"]))
+            except sqlite3.IntegrityError as exc:
+                raise Conflict("Seat is already occupied") from exc
+            return {"seat": seat, "stack": player["stack"]}
+
+    def stand_up(self, room_id: str, token: str) -> dict:
+        with self._transaction() as conn:
+            player = self._player(conn, room_id, token)
+            self._require_not_in_hand(conn, room_id, player["id"])
+            conn.execute("UPDATE room_players SET seat = NULL WHERE id = ?", (player["id"],))
+            return {"seat": None, "stack": player["stack"]}
+
+    def leave_room(self, room_id: str, token: str) -> dict:
+        with self._transaction() as conn:
+            player = self._player(conn, room_id, token)
+            self._require_not_in_hand(conn, room_id, player["id"])
+            conn.execute(
+                "UPDATE room_players SET seat = NULL, stack = 0, total_cashout = total_cashout + ?, "
+                "is_active = 0, left_at = ? WHERE id = ?",
+                (player["stack"], _now(), player["id"]),
+            )
+            return {"nickname": player["nickname"], "cashout": player["stack"]}
+
     def buy_in(self, room_id: str, token: str, amount: int, request_id: str) -> dict:
         if type(amount) is not int or amount <= 0:
             raise ValueError("Buy-in amount must be a positive integer")
@@ -209,6 +262,8 @@ class PokerStore:
                 return dict(existing)
             if room["status"] != "open":
                 raise Conflict("Room is closed")
+            if player["seat"] is None:
+                raise Conflict("Take a seat before buying chips")
             latest = self._latest_hand(conn, room_id)
             if latest and latest["status"] == "active":
                 raise Conflict("Buy-ins are allowed between hands only")
@@ -254,7 +309,8 @@ class PokerStore:
             if last and last["status"] == "active":
                 raise Conflict("Current hand is still active")
             rows = conn.execute(
-                "SELECT * FROM room_players WHERE room_id = ? AND stack > 0 ORDER BY seat",
+                "SELECT * FROM room_players WHERE room_id = ? AND is_active = 1 "
+                "AND seat IS NOT NULL AND stack > 0 ORDER BY seat",
                 (room_id,),
             ).fetchall()
             if len(rows) < 2:
@@ -461,17 +517,28 @@ class PokerStore:
                 active_stacks = {p.player_id: p.stack for p in game.players}
             players = []
             for row in conn.execute(
-                "SELECT id, nickname, seat, stack, total_buyin FROM room_players "
-                "WHERE room_id = ? ORDER BY seat", (room_id,)
+                "SELECT id, nickname, seat, stack, total_buyin, total_cashout "
+                "FROM room_players WHERE room_id = ? AND is_active = 1 "
+                "ORDER BY seat IS NULL, seat, created_at", (room_id,)
             ):
                 players.append({
                     "player_id": row["id"], "nickname": row["nickname"],
                     "seat": row["seat"],
                     "stack": active_stacks.get(row["id"], row["stack"]),
                     "total_buyin": row["total_buyin"],
-                    "max_topup_between_hands": (None if active_stacks else
+                    "total_cashout": row["total_cashout"],
+                    "profit_loss": row["stack"] + row["total_cashout"] - row["total_buyin"],
+                    "max_topup_between_hands": (None if active_stacks or row["seat"] is None else
                         max(0, room["max_buyin_stack"] - row["stack"])),
                 })
+            leaderboard = [
+                {"nickname": row["nickname"], "profit_loss": row["profit_loss"]}
+                for row in conn.execute(
+                    "SELECT nickname, SUM(stack + total_cashout - total_buyin) AS profit_loss "
+                    "FROM room_players WHERE room_id = ? GROUP BY nickname_key "
+                    "ORDER BY profit_loss DESC, nickname COLLATE NOCASE", (room_id,),
+                )
+            ]
             allowed = [row["nickname"] for row in conn.execute(
                 "SELECT nickname FROM allowed_nicknames WHERE room_id = ? ORDER BY nickname",
                 (room_id,),
@@ -484,7 +551,7 @@ class PokerStore:
                 "allowed_nicknames": allowed, "status": room["status"],
                 "latest_hand_id": last["id"] if last else None,
                 "latest_hand_status": last["status"] if last else None,
-                "players": players,
+                "players": players, "leaderboard": leaderboard,
             }
 
     def list_rooms(self) -> list[dict]:
@@ -509,9 +576,10 @@ class PokerStore:
             )
         } | {
             "players": [
-                {"nickname": p["nickname"], "seat": p["seat"], "stack": p["stack"]}
+                {"player_id": p["player_id"], "nickname": p["nickname"],
+                 "seat": p["seat"], "stack": p["stack"]}
                 for p in overview["players"]
-            ]
+            ], "leaderboard": overview["leaderboard"],
         }
 
     def player_view(self, room_id: str, token: str, hand_id: str | None = None) -> dict:
@@ -523,7 +591,8 @@ class PokerStore:
             ).fetchone() if hand_id else self._latest_hand(conn, room_id))
             if hand is None:
                 return {"room_id": room_id, "hand_id": None,
-                        "player_id": player["id"], "stack": player["stack"]}
+                        "player_id": player["id"], "viewer_player_id": player["id"],
+                        "status": "watching", "stack": player["stack"]}
             # Historical hands are visible only to their participants.
             participant = conn.execute(
                 "SELECT 1 FROM hand_players WHERE hand_id = ? AND player_id = ?",
@@ -532,9 +601,12 @@ class PokerStore:
             if not participant:
                 if hand_id is not None:
                     raise AccessDenied("Player did not participate in this hand")
-                return {"room_id": room_id, "hand_id": hand["id"],
-                        "status": "waiting_next_hand", "player_id": player["id"],
-                        "stack": player["stack"]}
+                view = HoldemGame.from_private_snapshot(
+                    json.loads(hand["private_snapshot"])
+                ).state_for_observer(player["id"])
+                view.update({"room_id": room_id, "status": "watching",
+                             "stack": player["stack"]})
+                return view
             return HoldemGame.from_private_snapshot(
                 json.loads(hand["private_snapshot"])
             ).state_for_player(player["id"])
