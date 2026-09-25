@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 import secrets
 import time
 from pathlib import Path
@@ -23,7 +24,6 @@ from ..services.storage import AccessDenied, Conflict, PokerStore, StoreError
 
 ROOT = Path(__file__).resolve().parents[3]
 FRONTEND = ROOT / "frontend"
-ACTION_SECONDS = 30
 logger = logging.getLogger(__name__)
 
 
@@ -37,6 +37,11 @@ class RoomBody(BaseModel):
     max_players: StrictInt
     max_buyin_stack: StrictInt
     allowed_nicknames: list[str] | None = None
+    preflop_seconds: StrictInt = 60
+    flop_seconds: StrictInt = 60
+    turn_seconds: StrictInt = 120
+    river_seconds: StrictInt = 180
+    runout_vote_seconds: StrictInt = 60
 
 
 class JoinBody(BaseModel):
@@ -55,6 +60,18 @@ class BuyinBody(BaseModel):
 
 class StartBody(BaseModel):
     request_id: StrictStr
+
+
+class ReadyBody(BaseModel):
+    ready: bool
+
+
+class VersionBody(BaseModel):
+    expected_version: StrictInt
+
+
+class VoteBody(VersionBody):
+    choice: StrictStr
 
 
 class ActionBody(BaseModel):
@@ -99,13 +116,14 @@ def create_app(db_path: str | Path | None = None, admin_password: str | None = N
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        await asyncio.to_thread(store.arm_missing_deadlines, ACTION_SECONDS)
+        await asyncio.to_thread(store.arm_missing_deadlines)
 
         async def timeout_loop():
             while True:
                 try:
-                    changed = await asyncio.to_thread(store.expire_due_actions,
-                                                      time.time(), ACTION_SECONDS)
+                    expired = await asyncio.to_thread(store.expire_due_actions, time.time(), None)
+                    started = await asyncio.to_thread(store.advance_rooms, time.time())
+                    changed = expired + started
                     for changed_room in set(changed):
                         await hub.broadcast(changed_room)
                 except Exception:
@@ -213,6 +231,8 @@ def create_app(db_path: str | Path | None = None, admin_password: str | None = N
         room_id = await asyncio.to_thread(
             store.create_room, body.small_blind, body.big_blind, body.max_players,
             body.max_buyin_stack, body.allowed_nicknames,
+            body.preflop_seconds, body.flop_seconds, body.turn_seconds,
+            body.river_seconds, body.runout_vote_seconds,
         )
         return {"room_id": room_id, "invite_url": str(request.base_url).rstrip("/") + f"/r/{room_id}"}
 
@@ -222,7 +242,19 @@ def create_app(db_path: str | Path | None = None, admin_password: str | None = N
 
     @app.post("/api/admin/rooms/{room_id}/hands", dependencies=[Depends(require_admin)])
     async def start_hand(room_id: str, body: StartBody):
-        result = await asyncio.to_thread(store.start_hand, room_id, body.request_id, ACTION_SECONDS)
+        result = await asyncio.to_thread(store.request_start, room_id)
+        await hub.broadcast(room_id)
+        return result
+
+    @app.post("/api/admin/rooms/{room_id}/pause", dependencies=[Depends(require_admin)])
+    async def pause_room(room_id: str):
+        result = await asyncio.to_thread(store.pause_room, room_id)
+        await hub.broadcast(room_id)
+        return result
+
+    @app.post("/api/admin/rooms/{room_id}/resume", dependencies=[Depends(require_admin)])
+    async def resume_room(room_id: str):
+        result = await asyncio.to_thread(store.resume_room, room_id)
         await hub.broadcast(room_id)
         return result
 
@@ -285,16 +317,53 @@ def create_app(db_path: str | Path | None = None, admin_password: str | None = N
         await hub.broadcast(room_id)
         return result
 
+    @app.post("/api/rooms/{room_id}/ready")
+    async def set_ready(room_id: str, body: ReadyBody, request: Request):
+        result = await asyncio.to_thread(store.set_ready, room_id,
+                                         player_token(request, room_id), body.ready)
+        await hub.broadcast(room_id)
+        return result
+
+    @app.post("/api/rooms/{room_id}/confirm-start")
+    async def confirm_start(room_id: str, request: Request):
+        result = await asyncio.to_thread(store.confirm_start, room_id,
+                                         player_token(request, room_id))
+        await hub.broadcast(room_id)
+        return result
+
     @app.post("/api/rooms/{room_id}/hands/{hand_id}/actions")
     async def act(room_id: str, hand_id: str, body: ActionBody, request: Request):
         token = player_token(request, room_id)
         result = await asyncio.to_thread(
             store.apply_action, room_id, hand_id, token,
             Action(body.action, body.amount), body.expected_version, body.request_id,
-            ACTION_SECONDS,
         )
         await hub.broadcast(room_id)
         return result
+
+    @app.post("/api/rooms/{room_id}/hands/{hand_id}/extend")
+    async def extend(room_id: str, hand_id: str, body: VersionBody, request: Request):
+        result = await asyncio.to_thread(store.extend_decision, room_id, hand_id,
+                                         player_token(request, room_id), body.expected_version)
+        await hub.broadcast(room_id)
+        return result
+
+    @app.post("/api/rooms/{room_id}/hands/{hand_id}/runout-vote")
+    async def runout_vote(room_id: str, hand_id: str, body: VoteBody, request: Request):
+        result = await asyncio.to_thread(store.vote_runout, room_id, hand_id,
+                                         player_token(request, room_id), body.choice,
+                                         body.expected_version)
+        await hub.broadcast(room_id)
+        return result
+
+    @app.get("/api/audio-manifest")
+    async def audio_manifest():
+        directory = FRONTEND / "src" / "audio"
+        pattern = re.compile(r"^(check|bet|raise|call|fold|allin|turn)[1-9]\d*\.(mp3|wav|ogg|m4a)$", re.I)
+        return {category: [f"/assets/audio/{path.name}" for path in sorted(directory.iterdir())
+                           if path.is_file() and pattern.fullmatch(path.name) and
+                           path.name.lower().startswith(category)]
+                for category in ("check", "bet", "raise", "call", "fold", "allin", "turn")}
 
     @app.get("/api/rooms/{room_id}/history")
     async def history(room_id: str, request: Request):

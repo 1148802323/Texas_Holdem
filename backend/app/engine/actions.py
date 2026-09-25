@@ -28,6 +28,7 @@ class ActionRecord:
     pot_after: int
     current_bet: int
     paid: int = 0  # chips actually moved by this action
+    all_in: bool = False
 
 
 @dataclass(frozen=True, slots=True)

@@ -2,6 +2,7 @@ const app = document.querySelector('#app');
 const roomId = location.pathname.startsWith('/r/') ? location.pathname.split('/')[2] : null;
 let socket = null;
 let roomData = null;
+let currentGame = null;
 let busy = false;
 let roomJoined = false;
 let historyData = null;
@@ -11,6 +12,50 @@ let currentHistoryKey = '';
 let historyLoading = false;
 let historyViewerId = null;
 let historyRevision = 0;
+let adminRoomsLoading = false;
+let audioManifest = {};
+let audioEnabled = false;
+let audioContext = null;
+const activeAudio = new Set();
+let lastActionEvent = null;
+let lastTurnEvent = null;
+
+async function loadAudioManifest() {
+  try { audioManifest = await api('/api/audio-manifest'); } catch { audioManifest = {}; }
+}
+function playAudio(category) {
+  if (!audioEnabled) return;
+  const choices = audioManifest[category] || [];
+  if (choices.length) {
+    const sound = new Audio(choices[Math.floor(Math.random() * choices.length)]);
+    activeAudio.add(sound);
+    sound.addEventListener('ended', () => activeAudio.delete(sound), { once: true });
+    sound.play().catch(() => activeAudio.delete(sound));
+  } else if (category === 'turn') {
+    try {
+      audioContext ||= new (window.AudioContext || window.webkitAudioContext)();
+      const oscillator = audioContext.createOscillator(), gain = audioContext.createGain();
+      oscillator.type = 'sine'; oscillator.frequency.value = 880;
+      gain.gain.setValueAtTime(0.08, audioContext.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, audioContext.currentTime + 0.25);
+      oscillator.connect(gain).connect(audioContext.destination);
+      oscillator.start(); oscillator.stop(audioContext.currentTime + 0.25);
+    } catch { /* Audio may be unavailable in this browser. */ }
+  }
+}
+
+function handleSounds(game, myId) {
+  const actionKey = `${game.hand_id}:${game.history?.length || 0}`;
+  if (lastActionEvent !== null && lastActionEvent !== actionKey && game.history?.length) {
+    const record = game.history[game.history.length - 1];
+    playAudio(record.all_in ? 'allin' : record.action);
+  }
+  lastActionEvent = actionKey;
+  const actor = game.players?.[game.to_act_index];
+  const turnKey = actor ? `${game.hand_id}:${game.street}:${game.history?.length || 0}:${actor.player_id}` : null;
+  if (turnKey && actor.player_id === myId && lastTurnEvent !== turnKey && game.deadline_at) playAudio('turn');
+  lastTurnEvent = turnKey;
+}
 
 function node(tag, value = '', className = '') {
   const element = document.createElement(tag);
@@ -63,7 +108,7 @@ function renderHome() {
 
 async function renderAdmin() {
   try { await api('/api/admin/session'); } catch { return showAdminLogin(); }
-  app.innerHTML = `<section class="hero compact"><div class="eyebrow">ROOM CONTROL</div><h1>牌局管理</h1><p>创建私人牌桌，设置规则并分享邀请链接。</p></section><div class="grid"><section class="panel"><h2>创建新牌局</h2><form id="create-room"><div class="row"><label class="field">小盲注<input name="sb" type="number" min="1" value="10" required></label><label class="field">大盲注<input name="bb" type="number" min="2" value="20" required></label></div><div class="row"><label class="field">牌桌人数<input name="seats" type="number" min="2" max="9" value="6" required></label><label class="field">买入后筹码上限<input name="cap" type="number" min="2" value="2000" required></label></div><label class="field">指定可用昵称（选填，用逗号分隔）<textarea name="names" rows="2" placeholder="留空允许自由输入昵称"></textarea></label><button class="btn" type="submit">创建并生成邀请链接</button></form><div id="created"></div></section><section class="panel"><div class="row"><h2>我的牌局</h2><button id="logout" class="btn secondary mini right">退出管理</button></div><div id="rooms"></div></section></div>`;
+  app.innerHTML = `<section class="hero compact"><div class="eyebrow">ROOM CONTROL</div><h1>牌局管理</h1><p>创建私人牌桌，设置规则并分享邀请链接。</p></section><div class="grid"><section class="panel"><h2>创建新牌局</h2><form id="create-room"><div class="row"><label class="field">小盲注<input name="sb" type="number" min="1" value="10" required></label><label class="field">大盲注<input name="bb" type="number" min="2" value="20" required></label></div><div class="row"><label class="field">牌桌人数<input name="seats" type="number" min="2" max="9" value="6" required></label><label class="field">买入后筹码上限<input name="cap" type="number" min="2" value="2000" required></label></div><div class="row"><label class="field">翻前秒数<input name="preflop" type="number" min="5" max="600" value="60" required></label><label class="field">翻牌秒数<input name="flop" type="number" min="5" max="600" value="60" required></label></div><div class="row"><label class="field">转牌秒数<input name="turn" type="number" min="5" max="600" value="120" required></label><label class="field">河牌秒数<input name="river" type="number" min="5" max="600" value="180" required></label></div><label class="field">全下发牌投票秒数<input name="vote" type="number" min="5" max="600" value="60" required></label><label class="field">指定可用昵称（选填，用逗号分隔）<textarea name="names" rows="2" placeholder="留空允许自由输入昵称"></textarea></label><button class="btn" type="submit">创建并生成邀请链接</button></form><div id="created"></div></section><section class="panel"><div class="row"><h2>我的牌局</h2><button id="logout" class="btn secondary mini right">退出管理</button></div><div id="rooms"></div></section></div>`;
   document.querySelector('#create-room').addEventListener('submit', async event => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
@@ -72,6 +117,9 @@ async function renderAdmin() {
       const result = await api('/api/admin/rooms', { method: 'POST', body: JSON.stringify({
         small_blind: Number(form.get('sb')), big_blind: Number(form.get('bb')),
         max_players: Number(form.get('seats')), max_buyin_stack: Number(form.get('cap')),
+        preflop_seconds: Number(form.get('preflop')), flop_seconds: Number(form.get('flop')),
+        turn_seconds: Number(form.get('turn')), river_seconds: Number(form.get('river')),
+        runout_vote_seconds: Number(form.get('vote')),
         allowed_nicknames: names.length ? names : null,
       }) });
       const output = document.querySelector('#created'); output.replaceChildren();
@@ -104,6 +152,8 @@ function showAdminLogin() {
 
 async function loadAdminRooms() {
   const container = document.querySelector('#rooms'); if (!container) return;
+  if (adminRoomsLoading) return;
+  adminRoomsLoading = true;
   try {
     const rooms = await api('/api/admin/rooms'); container.replaceChildren();
     if (!rooms.length) return container.append(node('p', '还没有牌局。', 'muted'));
@@ -116,20 +166,33 @@ async function loadAdminRooms() {
         `${p.nickname}：${money(p.stack)} 筹码 / 累计买入 ${money(p.total_buyin)}`).join(' · ') : '尚无人入座'));
       const controls = node('div', '', 'row');
       const link = node('a', '邀请链接', 'btn secondary mini'); link.href = `/r/${room.room_id}`;
-      const start = node('button', '开始下一手', 'btn mini'); start.type = 'button';
+      const start = node('button', '开始游戏', 'btn mini'); start.type = 'button';
       start.addEventListener('click', async () => {
         try {
           await api(`/api/admin/rooms/${room.room_id}/hands`, { method: 'POST', body: JSON.stringify({ request_id: crypto.randomUUID() }) });
-          notice('手牌已开始。', 'ok'); await loadAdminRooms();
+          notice('游戏已启动。', 'ok'); await loadAdminRooms();
         } catch (error) { notice(error.message); }
       });
-      controls.append(link, start); item.append(info, controls); container.append(item);
+      const pause = node('button', '暂停', 'btn secondary mini'); pause.type = 'button';
+      const resume = node('button', '恢复', 'btn secondary mini'); resume.type = 'button';
+      start.disabled = overview.play_state !== 'waiting';
+      pause.disabled = overview.play_state !== 'running' || overview.latest_hand_status !== 'active';
+      resume.disabled = overview.play_state !== 'paused';
+      for (const [button, path] of [[pause, 'pause'], [resume, 'resume']]) button.addEventListener('click', async () => {
+        try { await api(`/api/admin/rooms/${room.room_id}/${path}`, { method: 'POST' }); await loadAdminRooms(); }
+        catch (error) { notice(error.message); }
+      });
+      info.append(node('p', `状态：${({ waiting: '等待准备', running: '自动进行中', paused: '已暂停' })[overview.play_state]}`));
+      controls.append(link, start, pause, resume); item.append(info, controls); container.append(item);
     }
   } catch (error) { notice(error.message); }
+  finally { adminRoomsLoading = false; }
 }
+setInterval(() => { if (location.pathname === '/admin' && document.querySelector('#rooms')) loadAdminRooms(); }, 3000);
 
 async function enterRoom() {
   try {
+    if (!Object.keys(audioManifest).length) await loadAudioManifest();
     roomData = await api(`/api/rooms/${roomId}`);
     const state = await api(`/api/rooms/${roomId}/state`);
     roomJoined = true;
@@ -207,9 +270,11 @@ function positionAtTable(element, position, count, dealer = false) {
 function renderRoom(payload) {
   roomData = payload.room;
   const room = payload.room, game = payload.game;
+  currentGame = game;
   currentHistoryKey = `${game.viewer_player_id || game.player_id}:${game.hand_id || ''}:${game.version || 0}`;
   const active = game.street && game.street !== 'complete';
   const myId = game.viewer_player_id || game.player_id;
+  handleSounds(game, myId);
   if (historyViewerId !== myId) {
     historyViewerId = myId;
     historyData = null;
@@ -230,6 +295,14 @@ function renderRoom(payload) {
   }
   document.querySelector('#identity-name').textContent = roomMe?.nickname || '旁观者';
   document.querySelector('#identity-seat').textContent = seated ? `座位 ${roomMe.seat + 1}` : '正在旁观';
+  const audioToggle = node('button', audioEnabled ? '声音已开启' : '开启声音', 'btn secondary mini');
+  audioToggle.type = 'button';
+  audioToggle.addEventListener('click', async () => {
+    audioEnabled = !audioEnabled;
+    if (audioEnabled) { playAudio('turn'); audioContext?.resume?.(); }
+    audioToggle.textContent = audioEnabled ? '声音已开启' : '开启声音';
+  });
+  document.querySelector('.room-identity').prepend(audioToggle);
   document.querySelector('#leave-room').disabled = lockedInHand;
   document.querySelector('#leave-room').addEventListener('click', async () => {
     if (!confirm('确定退出牌桌并注销当前昵称吗？剩余筹码会计入离桌兑出，之后不能用此身份查看历史。')) return;
@@ -241,11 +314,21 @@ function renderRoom(payload) {
       notice('已退出牌桌。', 'ok');
     } catch (error) { notice(error.message); }
   });
-  document.querySelector('#street').textContent = ({ preflop: '翻牌前', flop: '翻牌', turn: '转牌', river: '河牌', complete: '本手已结束' })[game.street] || '等待下一手';
-  document.querySelector('#turn').textContent = current ? `轮到 ${current.name}` : active ? '牌局进行中' : '等待开局';
+  document.querySelector('#street').textContent = ({ preflop: '翻牌前', flop: '翻牌', turn: '转牌', river: '河牌', runout_vote: '全下发牌投票', complete: '本手已结束' })[game.street] || '等待下一手';
+  document.querySelector('#turn').textContent = room.play_state === 'paused' ? '游戏已暂停' : current ? `轮到 ${current.name}` : game.street === 'runout_vote' ? '等待入池玩家投票' : active ? '牌局进行中' : '等待开局';
   document.querySelector('#pot').textContent = money(game.pot);
   const board = document.querySelector('#board');
   for (let i = 0; i < 5; i++) board.append(card(game.community?.[i]));
+  if (game.runout_boards?.length > 1) {
+    const second = node('div', '', 'second-board');
+    second.append(node('span', '第二次', 'small'));
+    for (const code of game.runout_boards[1]) second.append(card(code));
+    document.querySelector('.table-center').append(second);
+  }
+  const publicClock = node('div', '', 'public-clock'); publicClock.id = 'public-clock';
+  publicClock.append(node('div', '', 'public-clock-title'), node('div', '', 'public-clock-track'));
+  document.querySelector('.table-center').append(publicClock);
+  updateTimer();
   const seats = document.querySelector('#seats');
   for (let position = 0; position < room.max_players; position++) {
     const person = room.players.find(p => p.seat === position);
@@ -264,7 +347,14 @@ function renderRoom(payload) {
       plus.disabled = lockedInHand;
       plus.addEventListener('click', () => takeSeat(position));
       item.append(plus, node('div', '点击入座', 'seat-name'));
-    } else item.append(node('div', person.nickname, 'seat-name'));
+    } else {
+      item.append(node('div', person.nickname, 'seat-name'));
+      if (person.ready && person.seat !== null) item.append(node('span', '已准备', 'ready-badge'));
+      if (room.play_state === 'waiting' && person.start_confirmed) item.append(node('span', '已确认开局', 'confirm-badge'));
+      if (game.street === 'runout_vote' && game.runout_votes?.[person.player_id]) {
+        item.append(node('span', `已选发${game.runout_votes[person.player_id] === 'twice' ? '两次' : '一次'}`, 'confirm-badge'));
+      }
+    }
     if (person) {
       const stack = money(active ? state?.stack ?? person.stack : person.stack);
       const wager = state?.bet_this_street ? money(state.bet_this_street) : '';
@@ -310,6 +400,24 @@ function renderRoom(payload) {
       catch (error) { notice(error.message); }
     });
     document.querySelector('#seat-controls').append(stand);
+    const ready = node('button', roomMe.ready ? '取消准备' : '准备进入牌局', roomMe.ready ? 'btn secondary mini' : 'btn mini ready-button');
+    ready.type = 'button'; ready.disabled = lockedInHand || (!roomMe.ready && roomMe.stack <= 0);
+    ready.addEventListener('click', async () => {
+      try { await api(`/api/rooms/${roomId}/ready`, { method: 'POST', body: JSON.stringify({ ready: !roomMe.ready }) }); await enterRoom(); }
+      catch (error) { notice(error.message); }
+    });
+    document.querySelector('#seat-controls').append(ready);
+    const allSeated = room.players.filter(p => p.seat !== null);
+    if (room.play_state === 'waiting' && allSeated.length >= 2 && allSeated.length < room.max_players &&
+        allSeated.every(p => p.ready)) {
+      const confirm = node('button', roomMe.start_confirmed ? '已确认，等待其他人' : '确认现在开局', 'btn mini confirm-button');
+      confirm.type = 'button'; confirm.disabled = roomMe.start_confirmed;
+      confirm.addEventListener('click', async () => {
+        try { await api(`/api/rooms/${roomId}/confirm-start`, { method: 'POST' }); await enterRoom(); }
+        catch (error) { notice(error.message); }
+      });
+      document.querySelector('#seat-controls').append(confirm);
+    }
   }
   renderBuyin(room, game, roomMe);
   renderActions(game, me);
@@ -366,13 +474,38 @@ function renderBuyin(room, game, roomMe) {
 function renderActions(game, me) {
   const area = document.querySelector('#action-area');
   if (game.status === 'watching') return area.append(node('p', '正在旁观。这手牌结束后，如果你已入座并买入筹码，就能参加下一手。', 'muted'));
-  if (!game.hand_id) return area.append(node('p', '等待房主开始第一手。', 'muted'));
-  if (game.street === 'complete') return area.append(node('p', '本手已结束，等待房主开始下一手。', 'muted'));
+  if (!game.hand_id) return area.append(node('p', roomData.play_state === 'running' ? '玩家已确认，即将发牌。' : '等待入座玩家准备并确认开局。', 'muted'));
+  if (game.street === 'complete') return area.append(node('p', roomData.play_state === 'running' ? '本手已结算，即将自动开始下一手。' : '本手已结算，等待开局。', 'muted'));
+  if (game.street === 'runout_vote') {
+    area.append(node('p', '入池玩家选择发一次或发两次。每个底池由有资格争夺该池的玩家共同决定；超时视为选择一次。', 'muted small'));
+    if (game.runout_can_vote && roomData.play_state !== 'paused') {
+      const controls = node('div', '', 'actions'); area.append(controls);
+      for (const [choice, title] of [['once', '发一次'], ['twice', '发两次']]) {
+        const button = node('button', title, 'btn'); button.type = 'button';
+        button.addEventListener('click', async () => {
+          try {
+            await api(`/api/rooms/${roomId}/hands/${game.hand_id}/runout-vote`, {
+              method: 'POST', body: JSON.stringify({ choice, expected_version: game.version }),
+            }); await enterRoom();
+          } catch (error) { await enterRoom(); notice(error.message); }
+        }); controls.append(button);
+      }
+    } else area.append(node('p', '等待其他入池玩家投票。', 'muted'));
+    return;
+  }
+  if (roomData.play_state === 'paused') return area.append(node('p', '管理员已暂停，恢复后继续当前玩家的剩余时间。', 'muted'));
   const legal = game.legal_actions;
   if (!legal) return area.append(node('p', `等待 ${game.players?.[game.to_act_index]?.name || '其他玩家'} 行动。`, 'muted'));
-  const timer = node('p', '', 'muted small'); timer.id = 'timer';
-  if (game.deadline_at) timer.dataset.deadline = String(game.deadline_at);
-  area.append(timer); updateTimer(game.deadline_at);
+  const extend = node('button', '⏱ 延长本次思考时间', 'btn extend-button');
+  extend.id = 'extend-decision'; extend.type = 'button'; extend.hidden = true;
+  extend.addEventListener('click', async () => {
+    try {
+      await api(`/api/rooms/${roomId}/hands/${game.hand_id}/extend`, {
+        method: 'POST', body: JSON.stringify({ expected_version: game.version }),
+      }); await enterRoom();
+    } catch (error) { await enterRoom(); notice(error.message); }
+  });
+  area.append(extend);
   const controls = node('div', '', 'actions'); area.append(controls);
   function button(title, action, amount = 0, style = 'secondary') {
     const control = node('button', title, `btn ${style}`); control.type = 'button';
@@ -409,16 +542,30 @@ async function sendAction(game, action, amount) {
   } catch (error) { await enterRoom(); notice(error.message); } finally { busy = false; }
 }
 
-function updateTimer(deadline) {
-  const timer = document.querySelector('#timer'); if (!timer) return;
-  if (!deadline) { timer.textContent = '轮到你行动。'; return; }
-  timer.textContent = `剩余 ${Math.max(0, Math.ceil(deadline - Date.now() / 1000))} 秒`;
+function updateTimer() {
+  const clock = document.querySelector('#public-clock');
+  const game = currentGame;
+  if (!clock || !game) return;
+  const active = game.street === 'runout_vote' || ['preflop', 'flop', 'turn', 'river'].includes(game.street);
+  clock.hidden = !active;
+  if (!active) return;
+  const remaining = roomData.play_state === 'paused' ? game.paused_remaining || 0 :
+    Math.max(0, (game.deadline_at || 0) - Date.now() / 1000);
+  const total = game.decision_total_seconds ||
+    roomData[game.street === 'runout_vote' ? 'runout_vote_seconds' : `${game.street}_seconds`] || 1;
+  const percent = Math.max(0, Math.min(100, Math.round(remaining / total * 100)));
+  const title = clock.querySelector('.public-clock-title');
+  title.textContent = `${roomData.play_state === 'paused' ? '已暂停 · ' : ''}${game.street === 'runout_vote' ? '发牌投票' : '行动倒计时'} ${Math.ceil(remaining)} 秒 · ${percent}%`;
+  const track = clock.querySelector('.public-clock-track');
+  track.style.setProperty('--remaining', `${percent}%`);
+  track.classList.toggle('urgent', remaining <= 5 && roomData.play_state !== 'paused');
+  const extend = document.querySelector('#extend-decision');
+  if (extend) extend.hidden = !(roomData.play_state !== 'paused' && game.legal_actions &&
+    !game.extension_used && remaining > 0 && remaining <= 5);
 }
 setInterval(() => {
-  if (!roomData) return;
-  const timer = document.querySelector('#timer');
-  if (timer?.dataset.deadline) updateTimer(Number(timer.dataset.deadline));
-}, 1000);
+  if (roomData) updateTimer();
+}, 250);
 
 function refreshHistoryIfNeeded() {
   if (roomJoined && currentHistoryKey !== historyKey) loadHistory();
@@ -463,6 +610,14 @@ function renderHistory() {
     details.append(node('summary', `第 ${hand.hand_number} 手 · ${balance} · 派彩 ${money(hand.payout)}`));
     const viewer = hand.view.players?.find(p => p.player_id === hand.view.viewer_player_id);
     details.append(node('p', `我的底牌：${viewer?.hole?.join(' ') || '—'} · 公共牌：${hand.view.community?.join(' ') || '—'}`, 'small'));
+    if (hand.view.runout_boards?.length > 1) {
+      details.append(node('p', `第二次公共牌：${hand.view.runout_boards[1].join(' ')}`, 'small'));
+    }
+    for (const [index, pot] of (hand.view.runout_pots || []).entries()) {
+      const awards = (pot.awards || []).map(award =>
+        `第${award.board}次 ${hand.view.players?.[award.player_index]?.name || '?'} +${money(award.amount)}`).join('；');
+      details.append(node('div', `${index === 0 ? '主池' : `边池${index}`} ${money(pot.amount)} · 发${pot.runs}次 · ${awards}`, 'small muted'));
+    }
     for (const record of hand.view.history || []) {
       details.append(node('div', `${record.player_name} ${label(record.action)} · 实际投入 ${money(record.paid)}`, 'small muted'));
     }

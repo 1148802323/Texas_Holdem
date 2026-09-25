@@ -39,7 +39,7 @@ class StorageTests(unittest.TestCase):
     def test_schema_identity_and_unique_seats(self):
         room_id, alice, bob = self.room()
         with closing(sqlite3.connect(self.path)) as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
             stored = conn.execute("SELECT session_token_hash FROM room_players WHERE id = ?",
                                   (alice.player_id,)).fetchone()[0]
         self.assertNotEqual(stored, alice.session_token)
@@ -316,10 +316,86 @@ class StorageTests(unittest.TestCase):
             conn.commit()
         self.store.initialize()
         with closing(sqlite3.connect(self.path)) as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
             self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
             self.assertEqual(conn.execute("SELECT player_id FROM hand_players").fetchone()[0], "p")
             self.assertEqual(conn.execute("SELECT seat FROM room_players WHERE id = 'p'").fetchone()[0], 0)
+
+    def test_ready_confirm_auto_continue_and_pause_resume(self):
+        room_id, alice, bob = self.room(first=100, second=100)
+        self.store.set_ready(room_id, alice.session_token, True)
+        self.store.set_ready(room_id, bob.session_token, True)
+        self.assertEqual(self.store.public_room(room_id)["play_state"], "waiting")
+        self.store.confirm_start(room_id, alice.session_token)
+        self.assertEqual(self.store.public_room(room_id)["play_state"], "waiting")
+        self.store.confirm_start(room_id, bob.session_token)
+        self.assertEqual(self.store.public_room(room_id)["play_state"], "running")
+        self.assertEqual(self.store.advance_rooms(), [room_id])
+        hand = self.store.load_game(room_id)
+        remaining = hand.deadline_at - time.time()
+        self.assertGreater(remaining, 50)
+        self.store.pause_room(room_id)
+        paused = self.store.load_game(room_id)
+        self.assertIsNone(paused.deadline_at)
+        self.assertAlmostEqual(paused.paused_remaining, remaining, delta=2)
+        self.assertEqual(self.store.expire_due_actions(time.time() + 1000, None), [])
+        with self.assertRaises(Conflict):
+            self.store.apply_action(room_id, hand.hand_id, alice.session_token,
+                                    Action(ActionType.FOLD), paused.version, "while-paused")
+        self.store.resume_room(room_id)
+        resumed = self.store.load_game(room_id)
+        self.assertAlmostEqual(resumed.deadline_at - time.time(), remaining, delta=2)
+        self.store.apply_action(room_id, hand.hand_id, alice.session_token,
+                                Action(ActionType.FOLD), resumed.version, "finish-first")
+        self.assertEqual(self.store.load_game(room_id).street, "complete")
+        self.assertTrue(all(p["ready"] for p in self.store.public_room(room_id)["players"]))
+        self.assertEqual(self.store.advance_rooms(time.time() + 10), [room_id])
+        self.assertEqual(self.store.load_game(room_id).hand_number, 2)
+
+    def test_runout_vote_timeout_survives_restart(self):
+        room_id = self.store.create_room(1, 2, 2, 10, runout_vote_seconds=60)
+        alice = self.store.join_player(room_id, "Alice", 0)
+        bob = self.store.join_player(room_id, "Bob", 1)
+        self.store.buy_in(room_id, alice.session_token, 1, "alice")
+        self.store.buy_in(room_id, bob.session_token, 1, "bob")
+        self.store.set_ready(room_id, alice.session_token, True)
+        self.store.set_ready(room_id, bob.session_token, True)
+        self.store.advance_rooms()
+        game = self.store.load_game(room_id)
+        self.assertEqual(game.street, "runout_vote")
+        self.store.pause_room(room_id)
+        self.assertEqual(self.store.expire_due_actions(time.time() + 1000, None), [])
+        self.store.resume_room(room_id)
+        game = self.store.load_game(room_id)
+        self.store.vote_runout(room_id, game.hand_id, alice.session_token, "twice", game.version)
+        reopened = PokerStore(self.path)
+        vote = reopened.load_game(room_id)
+        self.assertEqual(vote.runout_votes[0], "twice")
+        self.assertEqual(reopened.expire_due_actions(vote.deadline_at + 1, None), [room_id])
+        settled = reopened.load_game(room_id)
+        self.assertEqual(settled.street, "complete")
+        self.assertEqual(len(settled.runout_boards), 1)
+        self.assertEqual(sum(p.stack for p in settled.players), 2)
+        self.assertEqual(reopened.expire_due_actions(vote.deadline_at + 1, None), [])
+
+    def test_extension_is_persisted_and_only_current_actor_can_use_it(self):
+        room_id, alice, bob = self.room(first=100, second=100)
+        hand = self.store.start_hand(room_id, "extend", deadline_seconds=60)
+        game = self.store.load_game(room_id)
+        self.store.set_deadline(room_id, hand["hand_id"], time.time() + 4, game.version)
+        game = self.store.load_game(room_id)
+        with self.assertRaises(InvalidAction):
+            self.store.extend_decision(room_id, hand["hand_id"], bob.session_token,
+                                       game.version)
+        extended = self.store.extend_decision(room_id, hand["hand_id"], alice.session_token,
+                                              game.version)
+        restored = PokerStore(self.path).load_game(room_id)
+        self.assertTrue(restored.extension_used)
+        self.assertEqual(restored.version, extended["version"])
+        self.assertGreater(restored.deadline_at - time.time(), 60)
+        with self.assertRaises(InvalidAction):
+            self.store.extend_decision(room_id, hand["hand_id"], alice.session_token,
+                                       restored.version)
 
 
 if __name__ == "__main__":

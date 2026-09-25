@@ -69,6 +69,13 @@ class HoldemGame:
         self.street = "idle"
         self.to_act_index: int | None = None
         self.deadline_at: float | None = None
+        self.decision_total_seconds: float | None = None
+        self.extension_used = False
+        self.paused_remaining: float | None = None
+        self.runout_votes: dict[int, str] = {}
+        self.runout_boards: list[list[Card]] = []
+        self.runout_pots: list[dict] = []
+        self.runout_from_street: str | None = None
         self.version = 0
         self.history: list[ActionRecord] = []
         self.bet_this_street = [0] * len(players)
@@ -134,12 +141,19 @@ class HoldemGame:
         self.payouts = [0] * len(self.players)
         self.refunds = [0] * len(self.players)
         self.showdown = []
+        self.runout_votes = {}
+        self.runout_boards = []
+        self.runout_pots = []
+        self.runout_from_street = None
         self.pending.clear()
         self.acted_at_bet.clear()
         self.last_raise_size = self.bb
         self.current_bet = 0
         self.street = "preflop"
         self.deadline_at = None
+        self.decision_total_seconds = None
+        self.extension_used = False
+        self.paused_remaining = None
         sb, bb = self._blinds()
         self._take(sb, self.sb)
         self._take(bb, self.bb)
@@ -171,12 +185,54 @@ class HoldemGame:
 
     def set_deadline(self, deadline_at: float | None) -> None:
         """Attach an absolute UTC timestamp chosen by the room service."""
-        if self.to_act_index is None:
-            raise InvalidAction("No player is waiting to act")
+        if self.to_act_index is None and self.street != "runout_vote":
+            raise InvalidAction("No decision is waiting")
         if deadline_at is not None and (not isinstance(deadline_at, (int, float)) or
                                         not isfinite(deadline_at)):
             raise ValueError("Deadline must be a finite UTC timestamp or None")
         self.deadline_at = deadline_at
+        self.decision_total_seconds = None
+        self.extension_used = False
+        self.version += 1
+
+    def start_clock(self, seconds: int, now: float) -> None:
+        if self.to_act_index is None and self.street != "runout_vote":
+            raise InvalidAction("No decision is waiting")
+        if type(seconds) is not int or seconds <= 0 or not isfinite(now):
+            raise ValueError("Clock duration and time must be valid")
+        self.deadline_at = now + seconds
+        self.decision_total_seconds = float(seconds)
+        self.extension_used = False
+        self.paused_remaining = None
+        self.version += 1
+
+    def extend_clock(self, player_id: str, seconds: int, now: float) -> None:
+        if type(seconds) is not int or seconds <= 0 or not isfinite(now):
+            raise ValueError("Extension duration and time must be valid")
+        if self.street not in self.STREETS or self.to_act_index != self._seat(player_id):
+            raise InvalidAction("It is not this player's turn")
+        if self.paused_remaining is not None or self.deadline_at is None:
+            raise InvalidAction("Decision clock is not running")
+        remaining = self.deadline_at - now
+        if remaining <= 0 or remaining > 5 or self.extension_used:
+            raise InvalidAction("Extension is only available once in the final five seconds")
+        self.deadline_at += seconds
+        self.decision_total_seconds = remaining + seconds
+        self.extension_used = True
+        self.version += 1
+
+    def pause_clock(self, now: float) -> None:
+        if self.deadline_at is None or self.paused_remaining is not None:
+            raise InvalidAction("No running decision to pause")
+        self.paused_remaining = max(0.0, self.deadline_at - now)
+        self.deadline_at = None
+        self.version += 1
+
+    def resume_clock(self, now: float) -> None:
+        if self.paused_remaining is None:
+            raise InvalidAction("Decision is not paused")
+        self.deadline_at = now + self.paused_remaining
+        self.paused_remaining = None
         self.version += 1
 
     def legal_actions(self, player_id: str) -> LegalActions:
@@ -261,9 +317,12 @@ class HoldemGame:
         self.history.append(ActionRecord(
             self.street, i, self.players[i].name, action.type.value, action.amount,
             legal.to_call, self.table.pot, self.current_bet, paid,
+            self.players[i].all_in and action.type != ActionType.FOLD,
         ))
         self._advance_if_ready(start=i + 1)
         self.deadline_at = None
+        self.decision_total_seconds = None
+        self.extension_used = False
         self.version += 1
         return self.game_state()
 
@@ -283,8 +342,12 @@ class HoldemGame:
                     return
                 self.pending.clear()
             if len(self._can_act()) <= 1:
-                self._run_out_board()
-                self._settle_showdown()
+                if self.street == "river":
+                    self._settle_showdown()
+                else:
+                    self.runout_from_street = self.street
+                    self.street = "runout_vote"
+                    self.to_act_index = None
                 return
             if self.street == "river":
                 self._settle_showdown()
@@ -311,6 +374,61 @@ class HoldemGame:
         while self.street != "river":
             self._deal_next_street()
 
+    def submit_runout_vote(self, player_id: str, choice: str,
+                           expected_version: int | None = None) -> GameState:
+        if expected_version is not None and expected_version != self.version:
+            raise InvalidAction("Stale game version")
+        if self.street != "runout_vote":
+            raise InvalidAction("No runout vote is active")
+        i = self._seat(player_id)
+        if i not in self._live():
+            raise InvalidAction("Only live players may vote")
+        if i in self.runout_votes:
+            raise InvalidAction("Player has already voted")
+        if choice not in ("once", "twice"):
+            raise InvalidAction("Vote must be once or twice")
+        self.runout_votes[i] = choice
+        if len(self.runout_votes) == len(self._live()):
+            self.resolve_runout()
+        else:
+            self.version += 1
+        return self.game_state()
+
+    def resolve_runout(self) -> GameState:
+        if self.street != "runout_vote":
+            raise InvalidAction("No runout vote is active")
+        for i in self._live():
+            self.runout_votes.setdefault(i, "once")
+        self._refund_uncalled()
+        levels = sorted({amount for amount in self.contributed_total if amount > 0})
+        previous = 0
+        pots = []
+        for level in levels:
+            involved = [i for i, amount in enumerate(self.contributed_total) if amount >= level]
+            eligible = [i for i in involved if i in self._live()]
+            amount = (level - previous) * len(involved)
+            previous = level
+            if not eligible:
+                raise RuntimeError("Side pot has no eligible player")
+            runs = 2 if len(eligible) > 1 and all(
+                self.runout_votes[i] == "twice" for i in eligible) else 1
+            pots.append({"amount": amount, "eligible": eligible, "runs": runs})
+        prefix = self.table.community[:]
+        self.street = self.runout_from_street or "preflop"
+        self._run_out_board()
+        first = self.table.community[:]
+        self.runout_boards = [first]
+        if any(pot["runs"] == 2 for pot in pots):
+            self.table.community = prefix[:]
+            self.street = self.runout_from_street or "preflop"
+            self._run_out_board()
+            self.runout_boards.append(self.table.community[:])
+            self.table.community = first
+        self.runout_pots = pots
+        self._settle_showdown(refunded=True)
+        self.version += 1
+        return self.game_state()
+
     def _refund_uncalled(self) -> None:
         levels = sorted(self.contributed_total, reverse=True)
         if levels[0] == levels[1]:
@@ -328,27 +446,38 @@ class HoldemGame:
         self.players[winner].stack += self.table.pot
         self._finish()
 
-    def _settle_showdown(self) -> None:
-        self._refund_uncalled()
+    def _settle_showdown(self, refunded: bool = False) -> None:
+        if not refunded:
+            self._refund_uncalled()
         self.showdown = self._live()
-        scores = {i: evaluate_7(self.players[i].hole + self.table.community).score
-                  for i in self.showdown}
+        boards = self.runout_boards or [self.table.community]
+        scores = [{i: evaluate_7(self.players[i].hole + board).score
+                   for i in self.showdown} for board in boards]
         previous = 0
-        for level in sorted({amount for amount in self.contributed_total if amount > 0}):
+        for pot_index, level in enumerate(sorted({amount for amount in self.contributed_total if amount > 0})):
             involved = [i for i, amount in enumerate(self.contributed_total) if amount >= level]
-            eligible = [i for i in involved if i in scores]
+            eligible = [i for i in involved if i in self.showdown]
             pot = (level - previous) * len(involved)
             previous = level
             if not eligible:
                 raise RuntimeError("Side pot has no eligible player")
-            best = max(scores[i] for i in eligible)
-            winners = [i for i in eligible if scores[i] == best]
-            share, remainder = divmod(pot, len(winners))
-            winners.sort(key=lambda i: (i - self.button_index - 1) % len(self.players))
-            for position, i in enumerate(winners):
-                amount = share + (position < remainder)
-                self.players[i].stack += amount
-                self.payouts[i] += amount
+            runs = 2 if len(eligible) > 1 and len(boards) > 1 and all(
+                self.runout_votes.get(i) == "twice" for i in eligible) else 1
+            pot_results = []
+            for board_index in range(runs):
+                part = pot if runs == 1 else pot // 2 + (pot % 2 if board_index == 0 else 0)
+                best = max(scores[board_index][i] for i in eligible)
+                winners = [i for i in eligible if scores[board_index][i] == best]
+                share, remainder = divmod(part, len(winners))
+                winners.sort(key=lambda i: (i - self.button_index - 1) % len(self.players))
+                for position, i in enumerate(winners):
+                    amount = share + (position < remainder)
+                    self.players[i].stack += amount
+                    self.payouts[i] += amount
+                    pot_results.append({"board": board_index + 1, "player_index": i,
+                                        "amount": amount})
+            if self.runout_pots:
+                self.runout_pots[pot_index]["awards"] = pot_results
         self._finish()
 
     def _finish(self) -> None:
@@ -356,6 +485,8 @@ class HoldemGame:
         self.to_act_index = None
         self.pending.clear()
         self.deadline_at = None
+        self.decision_total_seconds = None
+        self.paused_remaining = None
         self.table.pot = 0
         self.bet_this_street = [0] * len(self.players)
         self.current_bet = 0
@@ -396,6 +527,13 @@ class HoldemGame:
             "version": self.version, "street": self.street,
             "button_index": self.button_index, "to_act_index": self.to_act_index,
             "deadline_at": self.deadline_at,
+            "decision_total_seconds": self.decision_total_seconds,
+            "paused_remaining": self.paused_remaining,
+            "extension_used": self.extension_used,
+            "runout_votes": {self.players[i].player_id: vote for i, vote in self.runout_votes.items()},
+            "runout_can_vote": seat in self._live() and seat not in self.runout_votes if seat is not None and self.street == "runout_vote" else False,
+            "runout_boards": [[c.code() for c in board] for board in self.runout_boards],
+            "runout_pots": self.runout_pots if self.street == "complete" else None,
             "community": [c.code() for c in self.table.community],
             "pot": self.table.pot, "current_bet": self.current_bet,
             "players": [
@@ -426,6 +564,13 @@ class HoldemGame:
             "hand_number": self.hand_number, "hand_id": self.hand_id,
             "street": self.street, "to_act_index": self.to_act_index,
             "deadline_at": self.deadline_at, "version": self.version,
+            "decision_total_seconds": self.decision_total_seconds,
+            "extension_used": self.extension_used,
+            "paused_remaining": self.paused_remaining,
+            "runout_votes": self.runout_votes.copy(),
+            "runout_boards": [[c.code() for c in board] for board in self.runout_boards],
+            "runout_pots": self.runout_pots[:],
+            "runout_from_street": self.runout_from_street,
             "history": [asdict(record) for record in self.history],
             "bet_this_street": self.bet_this_street[:],
             "contributed_total": self.contributed_total[:],
@@ -453,6 +598,13 @@ class HoldemGame:
         game.pending = set(snapshot["pending"])
         game.acted_at_bet = {int(i): amount for i, amount in snapshot["acted_at_bet"].items()}
         game.participants = set(snapshot["participants"])
+        game.decision_total_seconds = snapshot.get("decision_total_seconds")
+        game.extension_used = snapshot.get("extension_used", False)
+        game.paused_remaining = snapshot.get("paused_remaining")
+        game.runout_votes = {int(i): vote for i, vote in snapshot.get("runout_votes", {}).items()}
+        game.runout_boards = [[Card.from_code(c) for c in board] for board in snapshot.get("runout_boards", [])]
+        game.runout_pots = snapshot.get("runout_pots", [])
+        game.runout_from_street = snapshot.get("runout_from_street")
         return game
 
     def play_hand(self, strategies: dict[int, StrategyFn], default_strategy: StrategyFn,
@@ -460,6 +612,11 @@ class HoldemGame:
         """Compatibility adapter for the original local simulation."""
         self.start_new_hand()
         while self.street != "complete":
+            if self.street == "runout_vote":
+                for player_index in self._live():
+                    if player_index not in self.runout_votes:
+                        self.submit_runout_vote(self.players[player_index].player_id, "once")
+                continue
             i = self.to_act_index
             assert i is not None
             action = strategies.get(i, default_strategy)(

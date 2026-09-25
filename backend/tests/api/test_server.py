@@ -72,18 +72,19 @@ class BrowserApiTests(unittest.TestCase):
         self.assertEqual(self.client.post(f"/api/rooms/{room_id}/buyins", json={"amount": 100, "request_id": "a"}).status_code, 200)
         self.client.cookies.set(cookie_name, bob_cookie)
         self.assertEqual(self.client.post(f"/api/rooms/{room_id}/buyins", json={"amount": 100, "request_id": "b"}).status_code, 200)
+        self.assertEqual(self.client.post(f"/api/rooms/{room_id}/ready", json={"ready": True}).status_code, 200)
         self.client.cookies.set(cookie_name, alice_cookie)
+        self.assertEqual(self.client.post(f"/api/rooms/{room_id}/ready", json={"ready": True}).status_code, 200)
+        self.app.state.store.advance_rooms()
         with self.client.websocket_connect(f"/ws/rooms/{room_id}") as socket:
             waiting = socket.receive_json()
             self.assertEqual(waiting["type"], "state")
-            started = self.client.post(f"/api/admin/rooms/{room_id}/hands", json={"request_id": "first"})
-            self.assertEqual(started.status_code, 200, started.text)
-            update = socket.receive_json()
-            alice_state = update["game"]
+            alice_state = waiting["game"]
+            hand_id = alice_state["hand_id"]
             self.assertEqual(alice_state["to_act_index"], 0)
             self.assertEqual(len(alice_state["players"][0]["hole"]), 2)
             self.assertIsNone(alice_state["players"][1]["hole"])
-            self.assertNotIn("deck", json.dumps(update))
+            self.assertNotIn("deck", json.dumps(waiting))
         self.client.cookies.set(cookie_name, bob_cookie)
         with self.client.websocket_connect(f"/ws/rooms/{room_id}") as socket:
             bob_state = socket.receive_json()["game"]
@@ -91,7 +92,7 @@ class BrowserApiTests(unittest.TestCase):
             self.assertEqual(len(bob_state["players"][1]["hole"]), 2)
             self.client.cookies.set(cookie_name, alice_cookie)
             action = self.client.post(
-                f"/api/rooms/{room_id}/hands/{started.json()['hand_id']}/actions",
+                f"/api/rooms/{room_id}/hands/{hand_id}/actions",
                 json={"action": "fold", "amount": 0, "expected_version": alice_state["version"],
                       "request_id": "alice-fold"},
             )
@@ -136,8 +137,11 @@ class BrowserApiTests(unittest.TestCase):
         bob_cookie = self.client.cookies.get(cookie_name)
         self.client.post(f"/api/rooms/{room_id}/buyins",
                          json={"amount": 100, "request_id": "bob-buy"})
-        started = self.client.post(f"/api/admin/rooms/{room_id}/hands",
-                                   json={"request_id": "start"}).json()
+        self.client.post(f"/api/rooms/{room_id}/ready", json={"ready": True})
+        self.client.cookies.set(cookie_name, alice_cookie)
+        self.client.post(f"/api/rooms/{room_id}/ready", json={"ready": True})
+        self.app.state.store.advance_rooms()
+        started = self.client.get(f"/api/rooms/{room_id}/state").json()["game"]
         self.client.cookies.delete(cookie_name)
         self.client.post(f"/api/rooms/{room_id}/join", json={"nickname": "Carol"})
         with self.client.websocket_connect(f"/ws/rooms/{room_id}") as socket:
@@ -162,6 +166,42 @@ class BrowserApiTests(unittest.TestCase):
         leaderboard = self.client.get(f"/api/rooms/{room_id}").json()["leaderboard"]
         self.assertEqual(next(p["profit_loss"] for p in leaderboard if p["nickname"] == "Alice"), -1)
         self.assertNotEqual(bob_cookie, alice_cookie)
+
+    def test_ready_confirmation_pause_extend_and_audio_manifest(self):
+        room_id = self.create_room()
+        cookie_name = f"th_room_{room_id}"
+        self.client.post(f"/api/rooms/{room_id}/join", json={"nickname": "Alice", "seat": 0})
+        alice_cookie = self.client.cookies.get(cookie_name)
+        self.client.post(f"/api/rooms/{room_id}/buyins", json={"amount": 100, "request_id": "a"})
+        self.client.cookies.delete(cookie_name)
+        self.client.post(f"/api/rooms/{room_id}/join", json={"nickname": "Bob", "seat": 1})
+        bob_cookie = self.client.cookies.get(cookie_name)
+        self.client.post(f"/api/rooms/{room_id}/buyins", json={"amount": 100, "request_id": "b"})
+        self.assertEqual(self.client.post(f"/api/admin/rooms/{room_id}/hands",
+                         json={"request_id": "before-ready"}).status_code, 409)
+        self.client.post(f"/api/rooms/{room_id}/ready", json={"ready": True})
+        self.client.cookies.set(cookie_name, alice_cookie)
+        self.client.post(f"/api/rooms/{room_id}/ready", json={"ready": True})
+        self.app.state.store.advance_rooms()
+        state = self.client.get(f"/api/rooms/{room_id}/state").json()
+        hand_id = state["game"]["hand_id"]
+        self.assertEqual(state["game"]["decision_total_seconds"], 60)
+        self.assertEqual(self.client.post(f"/api/admin/rooms/{room_id}/pause").status_code, 200)
+        paused = self.client.get(f"/api/rooms/{room_id}/state").json()
+        self.assertEqual(paused["room"]["play_state"], "paused")
+        self.assertIsNone(paused["game"]["deadline_at"])
+        self.assertEqual(self.client.post(f"/api/rooms/{room_id}/hands/{hand_id}/actions",
+                         json={"action": "fold", "expected_version": paused["game"]["version"],
+                               "request_id": "paused-action"}).status_code, 409)
+        self.assertEqual(self.client.post(f"/api/admin/rooms/{room_id}/resume").status_code, 200)
+        resumed = self.client.get(f"/api/rooms/{room_id}/state").json()["game"]
+        self.assertIsNotNone(resumed["deadline_at"])
+        self.assertEqual(self.client.post(f"/api/rooms/{room_id}/hands/{hand_id}/extend",
+                         json={"expected_version": resumed["version"]}).status_code, 422)
+        manifest = self.client.get("/api/audio-manifest")
+        self.assertEqual(manifest.status_code, 200)
+        self.assertIn("allin", manifest.json())
+        self.client.cookies.set(cookie_name, bob_cookie)
 
 
 if __name__ == "__main__":

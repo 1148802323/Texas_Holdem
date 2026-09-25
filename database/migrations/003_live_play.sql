@@ -1,0 +1,12 @@
+BEGIN;
+ALTER TABLE rooms ADD COLUMN preflop_seconds INTEGER NOT NULL DEFAULT 60 CHECK (preflop_seconds BETWEEN 5 AND 600);
+ALTER TABLE rooms ADD COLUMN flop_seconds INTEGER NOT NULL DEFAULT 60 CHECK (flop_seconds BETWEEN 5 AND 600);
+ALTER TABLE rooms ADD COLUMN turn_seconds INTEGER NOT NULL DEFAULT 120 CHECK (turn_seconds BETWEEN 5 AND 600);
+ALTER TABLE rooms ADD COLUMN river_seconds INTEGER NOT NULL DEFAULT 180 CHECK (river_seconds BETWEEN 5 AND 600);
+ALTER TABLE rooms ADD COLUMN runout_vote_seconds INTEGER NOT NULL DEFAULT 60 CHECK (runout_vote_seconds BETWEEN 5 AND 600);
+ALTER TABLE rooms ADD COLUMN play_state TEXT NOT NULL DEFAULT 'waiting' CHECK (play_state IN ('waiting', 'running', 'paused'));
+ALTER TABLE rooms ADD COLUMN next_hand_at REAL;
+ALTER TABLE room_players ADD COLUMN ready INTEGER NOT NULL DEFAULT 0 CHECK (ready IN (0, 1));
+ALTER TABLE room_players ADD COLUMN start_confirmed INTEGER NOT NULL DEFAULT 0 CHECK (start_confirmed IN (0, 1));
+PRAGMA user_version = 3;
+COMMIT;

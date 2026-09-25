@@ -73,6 +73,8 @@ class HoldemEngineTests(unittest.TestCase):
         self.assertEqual(game.legal_actions(game.players[0].player_id).to_call, 1)
         self.assertFalse(game.legal_actions(game.players[0].player_id).can_raise)
         act(game, Action(ActionType.CALL))
+        self.assertEqual(game.street, "runout_vote")
+        game.resolve_runout()
         self.assertEqual(game.street, "complete")
         self.assertEqual(game.table.pot, 0)
         self.assertEqual(sum(p.stack for p in game.players), 21)
@@ -117,6 +119,8 @@ class HoldemEngineTests(unittest.TestCase):
         act(game, Action(ActionType.RAISE, 10))  # seat 1 all in for 10
         self.assertEqual(game.to_act_index, 2)
         act(game, Action(ActionType.CALL))
+        self.assertEqual(game.street, "runout_vote")
+        game.resolve_runout()
         self.assertEqual(game.street, "complete")
         self.assertEqual([p.stack for p in game.players], [15, 10, 10])
         self.assertEqual(game.payouts, [15, 10, 0])
@@ -174,6 +178,9 @@ class HoldemEngineTests(unittest.TestCase):
             for step in range(200):
                 if game.street == "complete":
                     break
+                if game.street == "runout_vote":
+                    game.resolve_runout()
+                    continue
                 i = game.to_act_index
                 assert i is not None
                 legal = game.legal_actions(game.players[i].player_id)
@@ -196,6 +203,54 @@ class HoldemEngineTests(unittest.TestCase):
                 self.fail("Hand did not finish")
             self.assertEqual(game.table.pot, 0)
             self.assertEqual(sum(p.stack for p in game.players), 320)
+
+    def test_per_pot_runout_vote_and_private_snapshot(self):
+        game = make_game([5, 10, 20])
+        game.players[0].hole = [Card.from_code(c) for c in ("As", "Ah")]
+        game.players[1].hole = [Card.from_code(c) for c in ("Ks", "Kh")]
+        game.players[2].hole = [Card.from_code(c) for c in ("Qh", "Qd")]
+        draw_order = ("Ts", "2c", "3d", "4h", "Js", "8s", "7c", "9c",
+                      "Tc", "Qc", "2d", "3h", "Jc", "5c", "7s", "8d")
+        game.deck._cards = [Card.from_code(c) for c in reversed(draw_order)]
+        act(game, Action(ActionType.RAISE, 5))
+        act(game, Action(ActionType.RAISE, 10))
+        act(game, Action(ActionType.CALL))
+        self.assertEqual(game.street, "runout_vote")
+        observer = game.state_for_observer("observer")
+        self.assertTrue(all(p["hole"] is None for p in observer["players"]))
+        self.assertNotIn("deck", json.dumps(observer))
+        game.submit_runout_vote(game.players[0].player_id, "once", game.version)
+        game.submit_runout_vote(game.players[1].player_id, "twice", game.version)
+        restored = HoldemGame.from_private_snapshot(json.loads(json.dumps(game.export_private_snapshot())))
+        restored.submit_runout_vote(restored.players[2].player_id, "twice", restored.version)
+        self.assertEqual(restored.street, "complete")
+        self.assertEqual([pot["runs"] for pot in restored.runout_pots], [1, 2])
+        self.assertEqual([(a["board"], a["player_index"], a["amount"])
+                          for a in restored.runout_pots[1]["awards"]],
+                         [(1, 1, 5), (2, 2, 5)])
+        self.assertEqual([p.stack for p in restored.players], [15, 5, 15])
+        self.assertEqual(restored.refunds, [0, 0, 0])
+        self.assertEqual(len(restored.runout_boards), 2)
+        self.assertEqual(len(set(restored.runout_boards[0] + restored.runout_boards[1])), 10)
+        with self.assertRaises(InvalidAction):
+            restored.resolve_runout()
+
+    def test_clock_extension_once_and_pause_remaining(self):
+        game = make_game([100, 100])
+        actor = game.players[game.to_act_index].player_id
+        game.start_clock(60, 1000)
+        with self.assertRaises(InvalidAction):
+            game.extend_clock(actor, 60, 1050)
+        game.extend_clock(actor, 60, 1056)
+        self.assertEqual(game.deadline_at, 1120)
+        with self.assertRaises(InvalidAction):
+            game.extend_clock(actor, 60, 1118)
+        game.pause_clock(1080)
+        self.assertEqual(game.paused_remaining, 40)
+        self.assertIsNone(game.deadline_at)
+        restored = HoldemGame.from_private_snapshot(game.export_private_snapshot())
+        restored.resume_clock(5000)
+        self.assertEqual(restored.deadline_at, 5040)
 
 
 if __name__ == "__main__":

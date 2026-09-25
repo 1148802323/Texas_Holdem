@@ -62,6 +62,8 @@ def _request_id(value: str) -> str:
 
 
 class PokerStore:
+    INTER_HAND_SECONDS = 4
+
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
 
@@ -100,7 +102,12 @@ class PokerStore:
                 conn.executescript(migration.read_text(encoding="utf-8"))
                 if conn.execute("PRAGMA foreign_key_check").fetchone():
                     raise RuntimeError("Observer migration left invalid foreign keys")
-            elif version != 2:
+                version = 2
+            if version == 2:
+                migration = (Path(__file__).resolve().parents[3] /
+                             "database/migrations/003_live_play.sql")
+                conn.executescript(migration.read_text(encoding="utf-8"))
+            elif version != 3:
                 raise RuntimeError(f"Unsupported database schema version: {version}")
 
     @staticmethod
@@ -130,14 +137,131 @@ class PokerStore:
             (room_id,),
         ).fetchone()
 
+    @staticmethod
+    def _clear_confirmations(conn: sqlite3.Connection, room_id: str) -> None:
+        conn.execute("UPDATE room_players SET start_confirmed = 0 WHERE room_id = ?", (room_id,))
+
+    @staticmethod
+    def _decision_seconds(room: sqlite3.Row, game: HoldemGame) -> int:
+        return room["runout_vote_seconds" if game.street == "runout_vote" else
+                    f"{game.street}_seconds"]
+
+    @staticmethod
+    def _eligible_rows(conn: sqlite3.Connection, room_id: str) -> list[sqlite3.Row]:
+        return conn.execute(
+            "SELECT * FROM room_players WHERE room_id = ? AND is_active = 1 "
+            "AND seat IS NOT NULL AND stack > 0 AND ready = 1 ORDER BY seat", (room_id,)
+        ).fetchall()
+
+    @classmethod
+    def _maybe_start(cls, conn: sqlite3.Connection, room: sqlite3.Row) -> bool:
+        if room["play_state"] != "waiting":
+            return False
+        seated = conn.execute(
+            "SELECT * FROM room_players WHERE room_id = ? AND is_active = 1 "
+            "AND seat IS NOT NULL ORDER BY seat", (room["id"],)
+        ).fetchall()
+        if len(seated) < 2 or any(not p["ready"] or p["stack"] <= 0 for p in seated):
+            return False
+        if len(seated) < room["max_players"] and any(not p["start_confirmed"] for p in seated):
+            return False
+        conn.execute("UPDATE rooms SET play_state = 'running', next_hand_at = ? WHERE id = ?",
+                     (time.time(), room["id"]))
+        return True
+
+    def set_ready(self, room_id: str, token: str, ready: bool) -> dict:
+        if type(ready) is not bool:
+            raise ValueError("ready must be a boolean")
+        with self._transaction() as conn:
+            room = self._room(conn, room_id)
+            player = self._player(conn, room_id, token)
+            if player["seat"] is None:
+                raise Conflict("Take a seat before becoming ready")
+            if ready and player["stack"] <= 0:
+                raise Conflict("Buy chips before becoming ready")
+            self._require_not_in_hand(conn, room_id, player["id"])
+            conn.execute("UPDATE room_players SET ready = ?, start_confirmed = 0 WHERE id = ?",
+                         (int(ready), player["id"]))
+            if room["play_state"] == "waiting":
+                self._clear_confirmations(conn, room_id)
+                self._maybe_start(conn, room)
+            return {"ready": ready}
+
+    def confirm_start(self, room_id: str, token: str) -> dict:
+        with self._transaction() as conn:
+            room = self._room(conn, room_id)
+            player = self._player(conn, room_id, token)
+            if room["play_state"] != "waiting":
+                raise Conflict("Room has already started")
+            if player["seat"] is None or not player["ready"] or player["stack"] <= 0:
+                raise Conflict("Sit, buy chips and become ready first")
+            seated = conn.execute("SELECT * FROM room_players WHERE room_id = ? AND is_active = 1 "
+                                  "AND seat IS NOT NULL", (room_id,)).fetchall()
+            if len(seated) < 2 or any(not p["ready"] or p["stack"] <= 0 for p in seated):
+                raise Conflict("All seated players must be ready")
+            conn.execute("UPDATE room_players SET start_confirmed = 1 WHERE id = ?", (player["id"],))
+            started = self._maybe_start(conn, room)
+            return {"confirmed": True, "started": started}
+
+    def request_start(self, room_id: str) -> dict:
+        with self._transaction() as conn:
+            room = self._room(conn, room_id)
+            if room["play_state"] == "paused":
+                raise Conflict("Resume the paused decision instead")
+            if room["play_state"] == "running":
+                raise Conflict("Room is already running")
+            if not self._maybe_start(conn, room):
+                raise Conflict("Waiting for all seated players to ready and confirm")
+            return {"started": True}
+
+    def pause_room(self, room_id: str, now: float | None = None) -> dict:
+        with self._transaction() as conn:
+            room = self._room(conn, room_id)
+            if room["play_state"] != "running":
+                raise Conflict("Room is not running")
+            hand = self._latest_hand(conn, room_id)
+            if hand is None or hand["status"] != "active":
+                raise Conflict("Pause is available only during a decision")
+            game = HoldemGame.from_private_snapshot(json.loads(hand["private_snapshot"]))
+            try:
+                game.pause_clock(time.time() if now is None else now)
+            except InvalidAction as exc:
+                raise Conflict(str(exc)) from exc
+            conn.execute("UPDATE hands SET version = ?, private_snapshot = ? WHERE id = ?",
+                         (game.version, _json(game.export_private_snapshot()), hand["id"]))
+            conn.execute("UPDATE rooms SET play_state = 'paused' WHERE id = ?", (room_id,))
+            return {"paused": True, "remaining": game.paused_remaining}
+
+    def resume_room(self, room_id: str, now: float | None = None) -> dict:
+        with self._transaction() as conn:
+            room = self._room(conn, room_id)
+            if room["play_state"] != "paused":
+                raise Conflict("Room is not paused")
+            hand = self._latest_hand(conn, room_id)
+            if hand is None or hand["status"] != "active":
+                raise Conflict("No paused decision")
+            game = HoldemGame.from_private_snapshot(json.loads(hand["private_snapshot"]))
+            game.resume_clock(time.time() if now is None else now)
+            conn.execute("UPDATE hands SET version = ?, private_snapshot = ? WHERE id = ?",
+                         (game.version, _json(game.export_private_snapshot()), hand["id"]))
+            conn.execute("UPDATE rooms SET play_state = 'running' WHERE id = ?", (room_id,))
+            return {"resumed": True, "deadline_at": game.deadline_at}
+
     def create_room(self, small_blind: int, big_blind: int, max_players: int,
-                    max_buyin_stack: int, allowed_nicknames: list[str] | None = None) -> str:
+                    max_buyin_stack: int, allowed_nicknames: list[str] | None = None,
+                    preflop_seconds: int = 60, flop_seconds: int = 60,
+                    turn_seconds: int = 120, river_seconds: int = 180,
+                    runout_vote_seconds: int = 60) -> str:
         if any(type(x) is not int for x in
                (small_blind, big_blind, max_players, max_buyin_stack)):
             raise ValueError("Room settings must be integers")
         if (not 0 < small_blind < big_blind or not 2 <= max_players <= 9 or
                 max_buyin_stack < big_blind):
             raise ValueError("Invalid blinds, table size, or buy-in stack limit")
+        timing = (preflop_seconds, flop_seconds, turn_seconds, river_seconds,
+                  runout_vote_seconds)
+        if any(type(value) is not int or not 5 <= value <= 600 for value in timing):
+            raise ValueError("Decision times must be integers between 5 and 600 seconds")
         names: dict[str, str] = {}
         if allowed_nicknames is not None:
             if not isinstance(allowed_nicknames, list) or not 1 <= len(allowed_nicknames) <= 100:
@@ -153,9 +277,11 @@ class PokerStore:
         with self._transaction() as conn:
             conn.execute(
                 "INSERT INTO rooms(id, small_blind, big_blind, max_players, "
-                "max_buyin_stack, nickname_policy, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "max_buyin_stack, nickname_policy, created_at, preflop_seconds, "
+                "flop_seconds, turn_seconds, river_seconds, runout_vote_seconds) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (room_id, small_blind, big_blind, max_players, max_buyin_stack,
-                 "preset" if allowed_nicknames is not None else "free", _now()),
+                 "preset" if allowed_nicknames is not None else "free", _now(), *timing),
             )
             for key, name in names.items():
                 conn.execute(
@@ -197,6 +323,8 @@ class PokerStore:
                 )
             except sqlite3.IntegrityError as exc:
                 raise Conflict("Nickname or seat is already occupied") from exc
+            if seat is not None and room["play_state"] == "waiting":
+                self._clear_confirmations(conn, room_id)
         return PlayerAccess(player_id, room_id, name, seat, token)
 
     @staticmethod
@@ -222,16 +350,20 @@ class PokerStore:
                 return {"seat": seat, "stack": player["stack"]}
             self._require_not_in_hand(conn, room_id, player["id"])
             try:
-                conn.execute("UPDATE room_players SET seat = ? WHERE id = ?", (seat, player["id"]))
+                conn.execute("UPDATE room_players SET seat = ?, ready = 0, start_confirmed = 0 WHERE id = ?", (seat, player["id"]))
             except sqlite3.IntegrityError as exc:
                 raise Conflict("Seat is already occupied") from exc
+            if room["play_state"] == "waiting":
+                self._clear_confirmations(conn, room_id)
             return {"seat": seat, "stack": player["stack"]}
 
     def stand_up(self, room_id: str, token: str) -> dict:
         with self._transaction() as conn:
             player = self._player(conn, room_id, token)
             self._require_not_in_hand(conn, room_id, player["id"])
-            conn.execute("UPDATE room_players SET seat = NULL WHERE id = ?", (player["id"],))
+            conn.execute("UPDATE room_players SET seat = NULL, ready = 0, start_confirmed = 0 WHERE id = ?", (player["id"],))
+            if self._room(conn, room_id)["play_state"] == "waiting":
+                self._clear_confirmations(conn, room_id)
             return {"seat": None, "stack": player["stack"]}
 
     def leave_room(self, room_id: str, token: str) -> dict:
@@ -240,9 +372,11 @@ class PokerStore:
             self._require_not_in_hand(conn, room_id, player["id"])
             conn.execute(
                 "UPDATE room_players SET seat = NULL, stack = 0, total_cashout = total_cashout + ?, "
-                "is_active = 0, left_at = ? WHERE id = ?",
+                "is_active = 0, ready = 0, start_confirmed = 0, left_at = ? WHERE id = ?",
                 (player["stack"], _now(), player["id"]),
             )
+            if self._room(conn, room_id)["play_state"] == "waiting":
+                self._clear_confirmations(conn, room_id)
             return {"nickname": player["nickname"], "cashout": player["stack"]}
 
     def buy_in(self, room_id: str, token: str, amount: int, request_id: str) -> dict:
@@ -286,10 +420,13 @@ class PokerStore:
                 "UPDATE room_players SET stack = ?, total_buyin = total_buyin + ? WHERE id = ?",
                 (after, amount, player["id"]),
             )
+            if room["play_state"] == "waiting":
+                self._maybe_start(conn, room)
             return entry
 
     def start_hand(self, room_id: str, request_id: str,
-                   deadline_seconds: int | None = None) -> dict:
+                   deadline_seconds: int | None = None,
+                   ready_only: bool = False) -> dict:
         _request_id(request_id)
         with self._transaction() as conn:
             room = self._room(conn, room_id)
@@ -308,11 +445,10 @@ class PokerStore:
             last = self._latest_hand(conn, room_id)
             if last and last["status"] == "active":
                 raise Conflict("Current hand is still active")
-            rows = conn.execute(
+            rows = (self._eligible_rows(conn, room_id) if ready_only else conn.execute(
                 "SELECT * FROM room_players WHERE room_id = ? AND is_active = 1 "
-                "AND seat IS NOT NULL AND stack > 0 ORDER BY seat",
-                (room_id,),
-            ).fetchall()
+                "AND seat IS NOT NULL AND stack > 0 ORDER BY seat", (room_id,),
+            ).fetchall())
             if len(rows) < 2:
                 raise Conflict("At least two players with chips are required")
             game = HoldemGame([Player(row["nickname"], row["stack"], row["id"])
@@ -330,8 +466,9 @@ class PokerStore:
                 # last stored physical seat, including after players move.
                 game.button_index = secrets.randbelow(len(rows))
             game.start_new_hand()
-            if game.street != "complete" and deadline_seconds is not None:
-                game.set_deadline(time.time() + deadline_seconds)
+            if game.street != "complete" and (deadline_seconds is not None or ready_only):
+                game.start_clock(deadline_seconds if deadline_seconds is not None else
+                                 self._decision_seconds(room, game), time.time())
             button_seat = rows[game.button_index]["seat"]
             small_blind_index, big_blind_index = game._blinds()
             conn.execute(
@@ -353,6 +490,10 @@ class PokerStore:
                 )
             if game.street == "complete":
                 self._save_settlement(conn, game)
+            if ready_only:
+                conn.execute("UPDATE rooms SET next_hand_at = ? WHERE id = ?",
+                             (time.time() + self.INTER_HAND_SECONDS if game.street == "complete"
+                              else None, room_id))
             return {"hand_id": game.hand_id, "hand_number": number,
                     "version": game.version, "to_act_index": game.to_act_index,
                     "status": game.street, "replayed": False}
@@ -379,7 +520,7 @@ class PokerStore:
         if not isinstance(action, Action) or not isinstance(action.type, ActionType):
             raise InvalidAction("Unknown action")
         with self._transaction() as conn:
-            self._room(conn, room_id)
+            room = self._room(conn, room_id)
             player = self._player(conn, room_id, token)
             hand = conn.execute(
                 "SELECT * FROM hands WHERE id = ? AND room_id = ?", (hand_id, room_id)
@@ -400,17 +541,23 @@ class PokerStore:
             if hand["status"] != "active" or self._latest_hand(conn, room_id)["id"] != hand_id:
                 raise Conflict("Hand is not active")
             game = HoldemGame.from_private_snapshot(json.loads(hand["private_snapshot"]))
+            if room["play_state"] == "paused":
+                raise Conflict("Room is paused")
+            if game.deadline_at is not None and game.deadline_at <= time.time():
+                raise Conflict("Decision time has expired")
             game.submit_action(player["id"], action, expected_version)
             self._persist_action(conn, hand_id, player["id"], request_id,
-                                 game, deadline_seconds)
+                                 game, room, deadline_seconds)
             return {"hand_id": hand_id, "version": game.version,
                     "status": game.street, "replayed": False}
 
     def _persist_action(self, conn: sqlite3.Connection, hand_id: str, player_id: str,
-                        request_id: str, game: HoldemGame,
+                        request_id: str, game: HoldemGame, room: sqlite3.Row,
                         deadline_seconds: int | None) -> None:
-        if game.street != "complete" and deadline_seconds is not None:
-            game.set_deadline(time.time() + deadline_seconds)
+        if game.street != "complete" and (deadline_seconds is not None or
+                                          room["play_state"] == "running"):
+            game.start_clock(deadline_seconds if deadline_seconds is not None else
+                             self._decision_seconds(room, game), time.time())
         record = game.history[-1]
         conn.execute(
             "INSERT INTO hand_actions(id, hand_id, player_id, request_id, sequence, "
@@ -429,9 +576,97 @@ class PokerStore:
         )
         if completed:
             self._save_settlement(conn, game)
+            if room["play_state"] == "running":
+                conn.execute("UPDATE rooms SET next_hand_at = ? WHERE id = ?",
+                             (time.time() + self.INTER_HAND_SECONDS, room["id"]))
+
+    def extend_decision(self, room_id: str, hand_id: str, token: str,
+                        expected_version: int, now: float | None = None) -> dict:
+        with self._transaction() as conn:
+            room = self._room(conn, room_id)
+            player = self._player(conn, room_id, token)
+            hand = self._latest_hand(conn, room_id)
+            if room["play_state"] == "paused" or hand is None or hand["id"] != hand_id or hand["status"] != "active":
+                raise Conflict("No running decision")
+            game = HoldemGame.from_private_snapshot(json.loads(hand["private_snapshot"]))
+            if game.version != expected_version:
+                raise InvalidAction("Stale game version")
+            game.extend_clock(player["id"], self._decision_seconds(room, game),
+                              time.time() if now is None else now)
+            conn.execute("UPDATE hands SET version = ?, private_snapshot = ? WHERE id = ?",
+                         (game.version, _json(game.export_private_snapshot()), hand_id))
+            return {"version": game.version, "deadline_at": game.deadline_at}
+
+    def vote_runout(self, room_id: str, hand_id: str, token: str, choice: str,
+                    expected_version: int) -> dict:
+        with self._transaction() as conn:
+            room = self._room(conn, room_id)
+            player = self._player(conn, room_id, token)
+            hand = self._latest_hand(conn, room_id)
+            if room["play_state"] == "paused" or hand is None or hand["id"] != hand_id or hand["status"] != "active":
+                raise Conflict("No active runout vote")
+            game = HoldemGame.from_private_snapshot(json.loads(hand["private_snapshot"]))
+            if game.deadline_at is not None and game.deadline_at <= time.time():
+                raise Conflict("Runout vote has expired")
+            game.submit_runout_vote(player["id"], choice, expected_version)
+            self._persist_game(conn, hand, game, room)
+            return {"version": game.version, "status": game.street}
+
+    def _persist_game(self, conn: sqlite3.Connection, hand: sqlite3.Row,
+                      game: HoldemGame, room: sqlite3.Row) -> None:
+        completed = game.street == "complete"
+        conn.execute("UPDATE hands SET status = ?, version = ?, private_snapshot = ?, "
+                     "completed_at = ? WHERE id = ?",
+                     ("complete" if completed else "active", game.version,
+                      _json(game.export_private_snapshot()), _now() if completed else None,
+                      hand["id"]))
+        if completed:
+            self._save_settlement(conn, game)
+            if room["play_state"] == "running":
+                conn.execute("UPDATE rooms SET next_hand_at = ? WHERE id = ?",
+                             (time.time() + self.INTER_HAND_SECONDS, room["id"]))
+
+    def advance_rooms(self, now: float | None = None) -> list[str]:
+        """Start scheduled hands, including after a server restart."""
+        now = time.time() if now is None else now
+        with closing(self._connect()) as conn:
+            candidates = [row["id"] for row in conn.execute(
+                "SELECT id FROM rooms WHERE play_state = 'running' AND next_hand_at <= ?", (now,)
+            )]
+        changed = []
+        for room_id in candidates:
+            with self._transaction() as conn:
+                room = self._room(conn, room_id)
+                latest = self._latest_hand(conn, room_id)
+                if (room["play_state"] != "running" or room["next_hand_at"] is None or
+                        room["next_hand_at"] > now or (latest and latest["status"] == "active")):
+                    continue
+                if len(self._eligible_rows(conn, room_id)) < 2:
+                    conn.execute("UPDATE rooms SET play_state = 'waiting', next_hand_at = NULL "
+                                 "WHERE id = ?", (room_id,))
+                    changed.append(room_id)
+                    continue
+                # Consume the due marker before starting, so a failed attempt cannot loop forever.
+                conn.execute("UPDATE rooms SET next_hand_at = NULL WHERE id = ?", (room_id,))
+            try:
+                self.start_hand(room_id, f"auto-{_new_id()}", ready_only=True)
+                changed.append(room_id)
+            except Conflict:
+                with self._transaction() as conn:
+                    room = self._room(conn, room_id)
+                    latest = self._latest_hand(conn, room_id)
+                    if room["play_state"] == "running" and (not latest or latest["status"] != "active"):
+                        if len(self._eligible_rows(conn, room_id)) < 2:
+                            conn.execute("UPDATE rooms SET play_state = 'waiting', next_hand_at = NULL "
+                                         "WHERE id = ?", (room_id,))
+                        else:
+                            conn.execute("UPDATE rooms SET next_hand_at = ? WHERE id = ?",
+                                         (time.time() + 1, room_id))
+                        changed.append(room_id)
+        return changed
 
     def expire_due_actions(self, now: float | None = None,
-                           deadline_seconds: int = 30) -> list[str]:
+                           deadline_seconds: int | None = 30) -> list[str]:
         """Trusted scheduler: check if possible, otherwise fold, then persist."""
         now = time.time() if now is None else now
         with closing(self._connect()) as conn:
@@ -444,8 +679,18 @@ class PokerStore:
                 hand = conn.execute("SELECT * FROM hands WHERE id = ?", (hand_id,)).fetchone()
                 if hand is None or hand["status"] != "active":
                     continue
+                room = self._room(conn, hand["room_id"])
+                if room["play_state"] == "paused":
+                    continue
                 game = HoldemGame.from_private_snapshot(json.loads(hand["private_snapshot"]))
-                if game.deadline_at is None or game.deadline_at > now or game.to_act_index is None:
+                if game.deadline_at is None or game.deadline_at > now:
+                    continue
+                if game.street == "runout_vote":
+                    game.resolve_runout()
+                    self._persist_game(conn, hand, game, room)
+                    changed_rooms.append(hand["room_id"])
+                    continue
+                if game.to_act_index is None:
                     continue
                 actor = game.players[game.to_act_index]
                 legal = game.legal_actions(actor.player_id)
@@ -453,11 +698,11 @@ class PokerStore:
                 old_version = game.version
                 game.submit_action(actor.player_id, action, old_version)
                 self._persist_action(conn, hand_id, actor.player_id,
-                                     f"auto-timeout-{old_version}", game, deadline_seconds)
+                                     f"auto-timeout-{old_version}", game, room, deadline_seconds)
                 changed_rooms.append(hand["room_id"])
         return changed_rooms
 
-    def arm_missing_deadlines(self, deadline_seconds: int = 30) -> list[str]:
+    def arm_missing_deadlines(self, deadline_seconds: int | None = None) -> list[str]:
         """Give older active snapshots a deadline when the server starts."""
         with closing(self._connect()) as conn:
             hand_ids = [row["id"] for row in conn.execute(
@@ -469,10 +714,14 @@ class PokerStore:
                 hand = conn.execute("SELECT * FROM hands WHERE id = ?", (hand_id,)).fetchone()
                 if hand is None or hand["status"] != "active":
                     continue
-                game = HoldemGame.from_private_snapshot(json.loads(hand["private_snapshot"]))
-                if game.deadline_at is not None or game.to_act_index is None:
+                room = self._room(conn, hand["room_id"])
+                if room["play_state"] == "paused":
                     continue
-                game.set_deadline(time.time() + deadline_seconds)
+                game = HoldemGame.from_private_snapshot(json.loads(hand["private_snapshot"]))
+                if game.deadline_at is not None or (game.to_act_index is None and game.street != "runout_vote"):
+                    continue
+                game.start_clock(deadline_seconds if deadline_seconds is not None else
+                                 self._decision_seconds(room, game), time.time())
                 conn.execute(
                     "UPDATE hands SET version = ?, private_snapshot = ? WHERE id = ?",
                     (game.version, _json(game.export_private_snapshot()), hand_id),
@@ -521,13 +770,15 @@ class PokerStore:
                 active_stacks = {p.player_id: p.stack for p in game.players}
             players = []
             for row in conn.execute(
-                "SELECT id, nickname, seat, stack, total_buyin, total_cashout "
+                "SELECT id, nickname, seat, stack, total_buyin, total_cashout, ready, start_confirmed "
                 "FROM room_players WHERE room_id = ? AND is_active = 1 "
                 "ORDER BY seat IS NULL, seat, created_at", (room_id,)
             ):
                 players.append({
                     "player_id": row["id"], "nickname": row["nickname"],
                     "seat": row["seat"],
+                    "ready": bool(row["ready"]),
+                    "start_confirmed": bool(row["start_confirmed"]),
                     "stack": active_stacks.get(row["id"], row["stack"]),
                     "total_buyin": row["total_buyin"],
                     "total_cashout": row["total_cashout"],
@@ -551,6 +802,13 @@ class PokerStore:
                 "room_id": room_id, "small_blind": room["small_blind"],
                 "big_blind": room["big_blind"], "max_players": room["max_players"],
                 "max_buyin_stack": room["max_buyin_stack"],
+                "preflop_seconds": room["preflop_seconds"],
+                "flop_seconds": room["flop_seconds"],
+                "turn_seconds": room["turn_seconds"],
+                "river_seconds": room["river_seconds"],
+                "runout_vote_seconds": room["runout_vote_seconds"],
+                "play_state": room["play_state"],
+                "next_hand_at": room["next_hand_at"],
                 "nickname_policy": room["nickname_policy"],
                 "allowed_nicknames": allowed, "status": room["status"],
                 "latest_hand_id": last["id"] if last else None,
@@ -565,6 +823,7 @@ class PokerStore:
                 {"room_id": row["id"], "small_blind": row["small_blind"],
                  "big_blind": row["big_blind"], "max_players": row["max_players"],
                  "max_buyin_stack": row["max_buyin_stack"], "status": row["status"],
+                 "play_state": row["play_state"],
                  "created_at": row["created_at"]}
                 for row in conn.execute("SELECT * FROM rooms ORDER BY created_at DESC")
             ]
@@ -576,12 +835,15 @@ class PokerStore:
             key: overview[key] for key in (
                 "room_id", "small_blind", "big_blind", "max_players",
                 "max_buyin_stack", "nickname_policy", "allowed_nicknames",
+                "preflop_seconds", "flop_seconds", "turn_seconds", "river_seconds",
+                "runout_vote_seconds", "play_state", "next_hand_at",
                 "status", "latest_hand_id", "latest_hand_status"
             )
         } | {
             "players": [
                 {"player_id": p["player_id"], "nickname": p["nickname"],
-                 "seat": p["seat"], "stack": p["stack"]}
+                 "seat": p["seat"], "stack": p["stack"],
+                 "ready": p["ready"], "start_confirmed": p["start_confirmed"]}
                 for p in overview["players"]
             ], "leaderboard": overview["leaderboard"],
         }
