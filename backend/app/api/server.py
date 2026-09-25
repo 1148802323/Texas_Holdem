@@ -163,6 +163,8 @@ def create_app(db_path: str | Path | None = None, admin_password: str | None = N
         response = await call_next(request)
         if request.url.path.startswith("/api/"):
             response.headers["Cache-Control"] = "no-store"
+        elif request.url.path.startswith("/assets/"):
+            response.headers["Cache-Control"] = "no-cache"
         return response
 
     @app.exception_handler(AccessDenied)

@@ -48,9 +48,14 @@ class BrowserApiTests(unittest.TestCase):
         return response.json()["room_id"]
 
     def test_admin_auth_join_cookie_reconnect_and_private_websocket(self):
-        self.assertEqual(self.client.get("/admin").status_code, 200)
-        self.assertEqual(self.client.get("/assets/main.js").status_code, 200)
-        self.assertEqual(self.client.get("/assets/styles/app.css").status_code, 200)
+        page = self.client.get("/admin")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn('/assets/main.js?v=0.8.3', page.text)
+        self.assertEqual(page.headers["Cache-Control"], "no-store")
+        script = self.client.get("/assets/main.js?v=0.8.3")
+        self.assertEqual(script.status_code, 200)
+        self.assertEqual(script.headers["Cache-Control"], "no-cache")
+        self.assertEqual(self.client.get("/assets/styles/app.css?v=0.8.3").status_code, 200)
         self.assertEqual(self.client.get("/api/admin/rooms").status_code, 401)
         room_id = self.create_room()
         self.assertEqual(self.client.get(f"/r/{room_id}").status_code, 200)
