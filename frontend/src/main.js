@@ -13,6 +13,7 @@ let historyLoading = false;
 let historyViewerId = null;
 let historyRevision = 0;
 let adminRoomsLoading = false;
+let adminRoomsSnapshot = null;
 let audioManifest = {};
 let audioEnabled = false;
 let audioContext = null;
@@ -125,6 +126,7 @@ function renderHome() {
 async function renderAdmin() {
   try { await api('/api/admin/session'); } catch { return showAdminLogin(); }
   app.innerHTML = `<section class="hero compact"><div class="eyebrow">ROOM CONTROL</div><h1>牌局管理</h1><p>创建私人牌桌，设置规则并分享邀请链接。</p></section><div class="grid"><section class="panel"><h2>创建新牌局</h2><form id="create-room"><div class="row"><label class="field">小盲注<input name="sb" type="number" min="1" value="10" required></label><label class="field">大盲注<input name="bb" type="number" min="2" value="20" required></label></div><div class="row"><label class="field">牌桌人数<input name="seats" type="number" min="2" max="9" value="6" required></label><label class="field">买入后筹码上限<input name="cap" type="number" min="2" value="2000" required></label></div><div class="row"><label class="field">翻前秒数<input name="preflop" type="number" min="5" max="600" value="60" required></label><label class="field">翻牌秒数<input name="flop" type="number" min="5" max="600" value="60" required></label></div><div class="row"><label class="field">转牌秒数<input name="turn" type="number" min="5" max="600" value="120" required></label><label class="field">河牌秒数<input name="river" type="number" min="5" max="600" value="180" required></label></div><label class="field">全下发牌投票秒数<input name="vote" type="number" min="5" max="600" value="60" required></label><label class="field">指定可用昵称（选填，用逗号分隔）<textarea name="names" rows="2" placeholder="留空允许自由输入昵称"></textarea></label><button class="btn" type="submit">创建并生成邀请链接</button></form><div id="created"></div></section><section class="panel"><div class="row"><h2>我的牌局</h2><button id="logout" class="btn secondary mini right">退出管理</button></div><div id="rooms"></div></section></div>`;
+  adminRoomsSnapshot = null;
   const recoveryPanel = node('section', '', 'panel recovery-panel');
   recoveryPanel.id = 'admin-recovery'; recoveryPanel.hidden = true;
   app.append(recoveryPanel);
@@ -176,12 +178,15 @@ async function loadAdminRooms() {
   adminRoomsLoading = true;
   try {
     const rooms = await api('/api/admin/rooms');
+    const overviews = await Promise.all(rooms.map(room => api(`/api/admin/rooms/${room.room_id}`)));
+    const snapshot = JSON.stringify({ rooms, overviews });
+    if (container !== document.querySelector('#rooms') || snapshot === adminRoomsSnapshot) return;
     const expandedEvents = new Set([...container.querySelectorAll('details.admin-events[open]')]
       .map(details => details.dataset.roomId));
-    container.replaceChildren();
-    if (!rooms.length) return container.append(node('p', '还没有牌局。', 'muted'));
-    for (const room of rooms) {
-      const overview = await api(`/api/admin/rooms/${room.room_id}`);
+    const fragment = document.createDocumentFragment();
+    if (!rooms.length) fragment.append(node('p', '还没有牌局。', 'muted'));
+    for (const [index, room] of rooms.entries()) {
+      const overview = overviews[index];
       const item = node('div', '', 'room-item'); const info = node('div');
       info.append(node('div', `牌局 ${room.room_id.slice(0, 8)}`, 'room-item-title'));
       info.append(node('p', `盲注 ${room.small_blind}/${room.big_blind} · ${room.max_players} 人 · 买入上限 ${money(room.max_buyin_stack)}`));
@@ -265,8 +270,11 @@ async function loadAdminRooms() {
           await loadAdminRooms();
         } catch (error) { notice(error.message); }
       });
-      controls.append(link, start, pause, resume, remove); item.append(info, controls); container.append(item);
+      controls.append(link, start, pause, resume, remove); item.append(info, controls); fragment.append(item);
     }
+    if (container !== document.querySelector('#rooms')) return;
+    container.replaceChildren(fragment);
+    adminRoomsSnapshot = snapshot;
   } catch (error) { notice(error.message); }
   finally { adminRoomsLoading = false; }
 }
