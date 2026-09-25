@@ -30,6 +30,7 @@
 .seat-head{display:block;font-size:11px;color:#d8bd84}
 .seat-name{font-size:13px;margin:1px 0;max-width:115px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .seat-chips{font-size:11px;line-height:1.25}
+.chips-compact{display:none}
 .seat-cards{margin:2px 0 0;justify-content:center}
 .seat-cards .playing-card{width:24px;height:32px;font-size:10px}
 .empty-seat{background:#0a2b25dc;border:1px dashed #e1c68d8a}
@@ -51,3 +52,37 @@
 .records-panel .field{margin-top:8px}.records-panel input[type=search]{width:100%}
 @media(max-width:1250px){.room-layout{grid-template-columns:minmax(0,1fr) minmax(0,2.5fr);grid-template-areas:"profit table" "records table"}.profit-panel{grid-area:profit}.records-panel{grid-area:records}.table-column{grid-area:table}}
 @media(max-width:900px){.room-layout{grid-template-columns:1fr;grid-template-areas:"table" "profit" "records"}.room-heading{align-items:start;flex-direction:column}.table-wrap{height:520px}.room-layout>.panel{padding:20px}.scroll-hint{display:block}}
+
+.dealer-button{position:absolute;z-index:5;display:grid;place-items:center;transform:translate(-50%,-50%);width:32px;height:32px;border-radius:50%;border:3px solid #f5e8c7;background:#fff7df;color:#1d4938;box-shadow:0 3px 10px #001a14b0;font-size:15px;font-weight:900;pointer-events:none}
+
+@media(max-width:900px){
+  main{padding-top:18px}
+  .room-heading{gap:8px;margin-bottom:12px}
+  .room-heading h1{font-size:28px;margin:5px 0}
+  .room-heading p{font-size:12px;line-height:1.4}
+  .room-identity{gap:6px}
+  .room-identity span{padding:5px 8px}
+  .room-identity .btn{min-height:28px;padding:5px 9px}
+  .table-column{gap:12px}
+  .table-scroll{overflow:visible;padding:0}
+  .table-wrap{width:100%;max-width:430px;min-width:0;height:min(520px,calc(100svh - 230px));min-height:330px;margin:0 auto;border-radius:24px}
+  .table-felt{inset:5% 4%;border-width:8px;border-radius:50% / 47%}
+  .table-top{top:8px;left:10px;right:10px;font-size:10px}
+  .table-center{top:50%;width:70%;gap:5px}
+  .board{min-height:36px;gap:2px}
+  .board .playing-card{width:24px;height:34px;border-radius:4px;font-size:11px}
+  .pot{min-width:108px;padding:3px 9px;font-size:9px}
+  .pot b{font-size:14px;margin-left:5px}
+  .seat{width:22%;min-height:58px;padding:2px;border-radius:10px;gap:1px}
+  .seat-head{font-size:9px}
+  .seat-name{font-size:11px;max-width:100%}
+  .seat-chips{font-size:8px;line-height:1;max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .chips-long{display:none}
+  .chips-compact{display:inline}
+  .seat-cards{margin-top:1px;gap:2px}
+  .seat-cards .playing-card{width:15px;height:20px;border-radius:3px;font-size:7px}
+  .seat-plus{width:22px;height:22px;margin:1px auto 0;font-size:16px}
+  .empty-seat .seat-name{font-size:9px}
+  .dealer-button{width:23px;height:23px;border-width:2px;font-size:11px}
+  .scroll-hint{display:none}
+}

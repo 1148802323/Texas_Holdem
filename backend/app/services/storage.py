@@ -325,6 +325,10 @@ class PokerStore:
                 )
                 game.hand_number = number - 1
                 game.button_index = (next_button_index - 1) % len(rows)
+            else:
+                # Draw only for the first hand; later hands rotate from the
+                # last stored physical seat, including after players move.
+                game.button_index = secrets.randbelow(len(rows))
             game.start_new_hand()
             if game.street != "complete" and deadline_seconds is not None:
                 game.set_deadline(time.time() + deadline_seconds)

@@ -5,6 +5,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 from uuid import uuid4
 
 from backend.app.engine.actions import Action, ActionType
@@ -18,8 +19,11 @@ class StorageTests(unittest.TestCase):
         self.path = Path("database") / f"test_{uuid4().hex}.sqlite3"
         self.store = PokerStore(self.path)
         self.store.initialize()
+        self.random_button = patch("backend.app.services.storage.secrets.randbelow", return_value=0)
+        self.random_button.start()
 
     def tearDown(self):
+        self.random_button.stop()
         self.path.unlink(missing_ok=True)
 
     def room(self, first=2000, second=2000):
@@ -115,6 +119,33 @@ class StorageTests(unittest.TestCase):
         with self.assertRaises(Conflict):
             reopened.apply_action(room_id, hand["hand_id"], alice.session_token,
                                   Action(ActionType.CALL), hand["version"], "late")
+
+    def test_first_button_is_random_then_rotates_by_physical_seat(self):
+        room_id = self.store.create_room(1, 2, 6, 2000)
+        players = {}
+        for name, seat in (("Alice", 0), ("Bob", 2), ("Carol", 5)):
+            access = self.store.join_player(room_id, name, seat)
+            players[access.player_id] = access.session_token
+            self.store.buy_in(room_id, access.session_token, 100, f"buy-{name}")
+        with patch("backend.app.services.storage.secrets.randbelow", return_value=2) as draw:
+            first = self.store.start_hand(room_id, "first-button")
+        draw.assert_called_once_with(3)
+        self.assertEqual(self.store.load_game(room_id).button_index, 2)
+        with closing(sqlite3.connect(self.path)) as conn:
+            self.assertEqual(conn.execute("SELECT button_seat FROM hands WHERE id = ?",
+                                          (first["hand_id"],)).fetchone()[0], 5)
+        self.assertTrue(self.store.start_hand(room_id, "first-button")["replayed"])
+        while self.store.load_game(room_id).street != "complete":
+            game = self.store.load_game(room_id)
+            actor = game.players[game.to_act_index]
+            self.store.apply_action(room_id, first["hand_id"], players[actor.player_id],
+                                    Action(ActionType.FOLD), game.version,
+                                    f"fold-{game.version}")
+        second = self.store.start_hand(room_id, "next-button")
+        self.assertEqual(self.store.load_game(room_id).button_index, 0)
+        with closing(sqlite3.connect(self.path)) as conn:
+            self.assertEqual(conn.execute("SELECT button_seat FROM hands WHERE id = ?",
+                                          (second["hand_id"],)).fetchone()[0], 0)
 
     def test_concurrent_buyins_do_not_break_limit(self):
         room_id, alice, _ = self.room(first=1600, second=0)

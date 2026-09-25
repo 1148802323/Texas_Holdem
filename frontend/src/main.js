@@ -195,6 +195,15 @@ function connectSocket() {
   };
 }
 
+function positionAtTable(element, position, count, dealer = false) {
+  const portrait = window.matchMedia('(max-width: 900px)').matches;
+  const angle = Math.PI - 2 * Math.PI * position / count;
+  const radiusX = dealer ? (portrait ? 20 : 27) : (portrait ? 35 : 39);
+  const radiusY = dealer ? (portrait ? 27 : 24) : 37;
+  element.style.left = `${50 + radiusX * Math.sin(angle)}%`;
+  element.style.top = `${50 - radiusY * Math.cos(angle)}%`;
+}
+
 function renderRoom(payload) {
   roomData = payload.room;
   const room = payload.room, game = payload.game;
@@ -242,12 +251,11 @@ function renderRoom(payload) {
     const person = room.players.find(p => p.seat === position);
     const state = person && game.players?.find(p => p.player_id === person.player_id);
     const item = node('div', '', 'seat');
-    const angle = Math.PI - 2 * Math.PI * position / room.max_players;
-    item.style.left = `${50 + 39 * Math.sin(angle)}%`;
-    item.style.top = `${50 - 37 * Math.cos(angle)}%`;
+    item.dataset.position = String(position);
+    positionAtTable(item, position, room.max_players);
     if (person?.player_id === myId) item.classList.add('me');
     if (current && state?.player_id === current.player_id) item.classList.add('turn');
-    item.append(node('div', `座位 ${position + 1}${game.button_index !== undefined && state === game.players?.[game.button_index] ? ' · 庄' : ''}`, 'seat-head'));
+    item.append(node('div', `座位 ${position + 1}`, 'seat-head'));
     if (!person) {
       item.classList.add('empty-seat');
       const plus = node('button', '+', 'seat-plus'); plus.type = 'button';
@@ -257,13 +265,29 @@ function renderRoom(payload) {
       plus.addEventListener('click', () => takeSeat(position));
       item.append(plus, node('div', '点击入座', 'seat-name'));
     } else item.append(node('div', person.nickname, 'seat-name'));
-    if (person) item.append(node('div', `${money(active ? state?.stack ?? person.stack : person.stack)} 筹码${state?.bet_this_street ? ` · 本轮 ${money(state.bet_this_street)}` : ''}${state?.folded ? ' · 已弃牌' : ''}${state?.all_in ? ' · 全下' : ''}`, 'seat-chips'));
+    if (person) {
+      const stack = money(active ? state?.stack ?? person.stack : person.stack);
+      const wager = state?.bet_this_street ? money(state.bet_this_street) : '';
+      const status = state?.folded ? '弃牌' : state?.all_in ? '全下' : '';
+      const chips = node('div', '', 'seat-chips');
+      chips.append(node('span', `${stack} 筹码${wager ? ` · 本轮 ${wager}` : ''}${status ? ` · ${status}` : ''}`, 'chips-long'));
+      chips.append(node('span', `${stack}${wager ? ` / 投${wager}` : ''}${status ? ` · ${status}` : ''}`, 'chips-compact'));
+      item.append(chips);
+    }
     if (state && (active || game.street === 'complete')) {
       const cards = node('div', '', 'seat-cards');
       const codes = state.hole || ['back', 'back'];
       codes.forEach(code => cards.append(card(code))); item.append(cards);
     }
     seats.append(item);
+    if (state && game.button_index !== undefined && state === game.players?.[game.button_index]) {
+      const dealer = node('div', 'D', 'dealer-button');
+      dealer.dataset.position = String(position);
+      dealer.title = '庄家按钮';
+      dealer.setAttribute('aria-label', `座位 ${position + 1} 的庄家按钮`);
+      positionAtTable(dealer, position, room.max_players, true);
+      seats.append(dealer);
+    }
   }
   const profitList = document.querySelector('#profit-list');
   for (const player of room.leaderboard || []) {
@@ -455,3 +479,11 @@ function renderHistory() {
 if (roomId) enterRoom();
 else if (location.pathname === '/admin') renderAdmin();
 else renderHome();
+
+window.addEventListener('resize', () => {
+  if (!roomData) return;
+  document.querySelectorAll('.seat[data-position], .dealer-button[data-position]').forEach(element => {
+    positionAtTable(element, Number(element.dataset.position), roomData.max_players,
+      element.classList.contains('dealer-button'));
+  });
+});

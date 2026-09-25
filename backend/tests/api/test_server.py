@@ -24,12 +24,15 @@ class BrowserApiTests(unittest.TestCase):
 
     def setUp(self):
         self.path = Path("database") / f"api_test_{uuid4().hex}.sqlite3"
+        self.random_button = patch("backend.app.services.storage.secrets.randbelow", return_value=0)
+        self.random_button.start()
         self.app = create_app(self.path, "test-admin-password")
         self.client_context = TestClient(self.app)
         self.client = self.client_context.__enter__()
 
     def tearDown(self):
         self.client_context.__exit__(None, None, None)
+        self.random_button.stop()
         self.path.unlink(missing_ok=True)
 
     def create_room(self):
