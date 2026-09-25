@@ -107,7 +107,12 @@ class PokerStore:
                 migration = (Path(__file__).resolve().parents[3] /
                              "database/migrations/003_live_play.sql")
                 conn.executescript(migration.read_text(encoding="utf-8"))
-            elif version != 3:
+                version = 3
+            if version == 3:
+                migration = (Path(__file__).resolve().parents[3] /
+                             "database/migrations/004_player_recovery.sql")
+                conn.executescript(migration.read_text(encoding="utf-8"))
+            elif version != 4:
                 raise RuntimeError(f"Unsupported database schema version: {version}")
 
     @staticmethod
@@ -138,6 +143,24 @@ class PokerStore:
         ).fetchone()
 
     @staticmethod
+    def _player_by_id(conn: sqlite3.Connection, room_id: str, player_id: str) -> sqlite3.Row:
+        player = conn.execute(
+            "SELECT * FROM room_players WHERE room_id = ? AND id = ? AND is_active = 1",
+            (room_id, player_id),
+        ).fetchone()
+        if player is None:
+            raise StoreError("Active player does not exist")
+        return player
+
+    @staticmethod
+    def _admin_event(conn: sqlite3.Connection, room_id: str, player_id: str | None,
+                     action: str) -> None:
+        conn.execute(
+            "INSERT INTO room_admin_events(id, room_id, player_id, action, created_at) "
+            "VALUES (?, ?, ?, ?, ?)", (_new_id(), room_id, player_id, action, _now()),
+        )
+
+    @staticmethod
     def _clear_confirmations(conn: sqlite3.Connection, room_id: str) -> None:
         conn.execute("UPDATE room_players SET start_confirmed = 0 WHERE room_id = ?", (room_id,))
 
@@ -155,7 +178,7 @@ class PokerStore:
 
     @classmethod
     def _maybe_start(cls, conn: sqlite3.Connection, room: sqlite3.Row) -> bool:
-        if room["play_state"] != "waiting":
+        if room["status"] != "open" or room["play_state"] != "waiting":
             return False
         seated = conn.execute(
             "SELECT * FROM room_players WHERE room_id = ? AND is_active = 1 "
@@ -174,6 +197,8 @@ class PokerStore:
             raise ValueError("ready must be a boolean")
         with self._transaction() as conn:
             room = self._room(conn, room_id)
+            if room["status"] != "open":
+                raise Conflict("Room is closed")
             player = self._player(conn, room_id, token)
             if player["seat"] is None:
                 raise Conflict("Take a seat before becoming ready")
@@ -190,6 +215,8 @@ class PokerStore:
     def confirm_start(self, room_id: str, token: str) -> dict:
         with self._transaction() as conn:
             room = self._room(conn, room_id)
+            if room["status"] != "open":
+                raise Conflict("Room is closed")
             player = self._player(conn, room_id, token)
             if room["play_state"] != "waiting":
                 raise Conflict("Room has already started")
@@ -206,6 +233,8 @@ class PokerStore:
     def request_start(self, room_id: str) -> dict:
         with self._transaction() as conn:
             room = self._room(conn, room_id)
+            if room["status"] != "open":
+                raise Conflict("Room is closed")
             if room["play_state"] == "paused":
                 raise Conflict("Resume the paused decision instead")
             if room["play_state"] == "running":
@@ -213,6 +242,164 @@ class PokerStore:
             if not self._maybe_start(conn, room):
                 raise Conflict("Waiting for all seated players to ready and confirm")
             return {"started": True}
+
+    def archive_room(self, room_id: str) -> dict:
+        """Remove a room from the admin list without deleting its financial history.
+
+        An active hand remains playable until settlement, including when the
+        administrator had paused its current decision.
+        """
+        with self._transaction() as conn:
+            room = self._room(conn, room_id)
+            if room["status"] == "closed":
+                return {"room_id": room_id, "archived": True, "replayed": True}
+            hand = self._latest_hand(conn, room_id)
+            active = hand is not None and hand["status"] == "active"
+            if active and room["play_state"] == "paused":
+                game = HoldemGame.from_private_snapshot(json.loads(hand["private_snapshot"]))
+                game.resume_clock(time.time())
+                conn.execute("UPDATE hands SET version = ?, private_snapshot = ? WHERE id = ?",
+                             (game.version, _json(game.export_private_snapshot()), hand["id"]))
+            elif active:
+                game = HoldemGame.from_private_snapshot(json.loads(hand["private_snapshot"]))
+                if game.deadline_at is None:
+                    game.start_clock(self._decision_seconds(room, game), time.time())
+                    conn.execute("UPDATE hands SET version = ?, private_snapshot = ? WHERE id = ?",
+                                 (game.version, _json(game.export_private_snapshot()), hand["id"]))
+            conn.execute("UPDATE rooms SET status = 'closed', play_state = 'waiting', "
+                         "next_hand_at = NULL WHERE id = ?", (room_id,))
+            conn.execute("UPDATE player_recovery_codes SET revoked_at = ? "
+                         "WHERE room_id = ? AND consumed_at IS NULL AND revoked_at IS NULL",
+                         (time.time(), room_id))
+            self._admin_event(conn, room_id, None, "room_archived")
+            return {"room_id": room_id, "archived": True,
+                    "active_hand_finishing": active, "replayed": False}
+
+    def issue_recovery_code(self, room_id: str, player_id: str) -> dict:
+        """Generate a short-lived, one-use secret; only the authenticated admin may call this."""
+        with self._transaction() as conn:
+            room = self._room(conn, room_id)
+            if room["status"] != "open":
+                raise Conflict("Room is closed")
+            player = self._player_by_id(conn, room_id, player_id)
+            now = time.time()
+            conn.execute("UPDATE player_recovery_codes SET revoked_at = ? "
+                         "WHERE room_id = ? AND player_id = ? AND consumed_at IS NULL "
+                         "AND revoked_at IS NULL", (now, room_id, player_id))
+            code = secrets.token_urlsafe(24)
+            expires_at = now + 15 * 60
+            conn.execute(
+                "INSERT INTO player_recovery_codes(id, room_id, player_id, code_hash, "
+                "expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (_new_id(), room_id, player_id, hashlib.sha256(code.encode()).hexdigest(),
+                 expires_at, _now()),
+            )
+            self._admin_event(conn, room_id, player_id, "recovery_issued")
+            return {"room_id": room_id, "player_id": player_id,
+                    "nickname": player["nickname"], "code": code, "expires_at": expires_at}
+
+    def recover_player(self, room_id: str, code: str) -> PlayerAccess:
+        if not isinstance(code, str) or not 8 <= len(code.strip()) <= 128:
+            raise AccessDenied("Invalid or expired recovery code")
+        digest = hashlib.sha256(code.strip().encode()).hexdigest()
+        with self._transaction() as conn:
+            room = self._room(conn, room_id)
+            if room["status"] != "open":
+                raise AccessDenied("Invalid or expired recovery code")
+            recovery = conn.execute(
+                "SELECT c.id, c.player_id, c.expires_at, c.consumed_at, c.revoked_at, "
+                "p.nickname, p.seat, p.is_active FROM player_recovery_codes c "
+                "JOIN room_players p ON p.id = c.player_id "
+                "WHERE c.room_id = ? AND c.code_hash = ?", (room_id, digest),
+            ).fetchone()
+            if (recovery is None or recovery["consumed_at"] is not None or
+                    recovery["revoked_at"] is not None or
+                    recovery["expires_at"] <= time.time() or not recovery["is_active"]):
+                raise AccessDenied("Invalid or expired recovery code")
+            token = secrets.token_urlsafe(32)
+            now = time.time()
+            conn.execute("UPDATE player_recovery_codes SET consumed_at = ? WHERE id = ?",
+                         (now, recovery["id"]))
+            conn.execute("UPDATE player_recovery_codes SET revoked_at = ? WHERE room_id = ? "
+                         "AND player_id = ? AND consumed_at IS NULL AND revoked_at IS NULL",
+                         (now, room_id, recovery["player_id"]))
+            conn.execute("UPDATE room_players SET session_token_hash = ? WHERE id = ?",
+                         (hashlib.sha256(token.encode()).hexdigest(), recovery["player_id"]))
+            self._admin_event(conn, room_id, recovery["player_id"], "recovery_used")
+            return PlayerAccess(recovery["player_id"], room_id, recovery["nickname"],
+                                recovery["seat"], token)
+
+    @classmethod
+    def _apply_admin_action(cls, conn: sqlite3.Connection, room_id: str,
+                            player_id: str, action: str) -> None:
+        player = cls._player_by_id(conn, room_id, player_id)
+        if action == "stand":
+            conn.execute("UPDATE room_players SET seat = NULL, ready = 0, "
+                         "start_confirmed = 0, pending_admin_action = NULL WHERE id = ?",
+                         (player_id,))
+            cls._admin_event(conn, room_id, player_id, "stand_applied")
+        elif action == "remove":
+            conn.execute(
+                "UPDATE room_players SET seat = NULL, stack = 0, "
+                "total_cashout = total_cashout + ?, is_active = 0, ready = 0, "
+                "start_confirmed = 0, pending_admin_action = NULL, left_at = ? WHERE id = ?",
+                (player["stack"], _now(), player_id),
+            )
+            conn.execute("UPDATE player_recovery_codes SET revoked_at = ? "
+                         "WHERE player_id = ? AND consumed_at IS NULL AND revoked_at IS NULL",
+                         (time.time(), player_id))
+            cls._admin_event(conn, room_id, player_id, "remove_applied")
+        else:
+            raise ValueError("Unknown administrator action")
+
+    @classmethod
+    def _stop_if_insufficient(cls, conn: sqlite3.Connection, room_id: str) -> None:
+        room = cls._room(conn, room_id)
+        hand = cls._latest_hand(conn, room_id)
+        if (room["play_state"] == "running" and
+                (hand is None or hand["status"] != "active") and
+                len(cls._eligible_rows(conn, room_id)) < 2):
+            conn.execute("UPDATE rooms SET play_state = 'waiting', next_hand_at = NULL "
+                         "WHERE id = ?", (room_id,))
+
+    def request_player_action(self, room_id: str, player_id: str, action: str) -> dict:
+        if action not in ("stand", "remove"):
+            raise ValueError("Action must be stand or remove")
+        with self._transaction() as conn:
+            room = self._room(conn, room_id)
+            if room["status"] != "open":
+                raise Conflict("Room is closed")
+            player = self._player_by_id(conn, room_id, player_id)
+            if action == "stand" and player["seat"] is None:
+                raise Conflict("Player is already standing")
+            hand = self._latest_hand(conn, room_id)
+            participating = bool(hand and hand["status"] == "active" and conn.execute(
+                "SELECT 1 FROM hand_players WHERE hand_id = ? AND player_id = ?",
+                (hand["id"], player_id),
+            ).fetchone())
+            if participating:
+                if player["pending_admin_action"] == action:
+                    return {"queued": True, "action": action, "replayed": True}
+                conn.execute("UPDATE room_players SET pending_admin_action = ? WHERE id = ?",
+                             (action, player_id))
+                self._admin_event(conn, room_id, player_id, f"{action}_queued")
+                return {"queued": True, "action": action, "replayed": False}
+            self._apply_admin_action(conn, room_id, player_id, action)
+            if room["play_state"] == "waiting":
+                self._clear_confirmations(conn, room_id)
+            self._stop_if_insufficient(conn, room_id)
+            return {"queued": False, "action": action, "replayed": False}
+
+    def connected_player_ids(self, room_id: str, tokens: list[str]) -> set[str]:
+        if not tokens:
+            return set()
+        digests = [hashlib.sha256(token.encode()).hexdigest() for token in tokens]
+        with closing(self._connect()) as conn:
+            return {row["id"] for row in conn.execute(
+                "SELECT id FROM room_players WHERE room_id = ? AND is_active = 1 AND "
+                f"session_token_hash IN ({','.join('?' for _ in digests)})",
+                [room_id, *digests],
+            )}
 
     def pause_room(self, room_id: str, now: float | None = None) -> dict:
         with self._transaction() as conn:
@@ -491,15 +678,16 @@ class PokerStore:
             if game.street == "complete":
                 self._save_settlement(conn, game)
             if ready_only:
+                continuing = self._room(conn, room_id)["play_state"] == "running"
                 conn.execute("UPDATE rooms SET next_hand_at = ? WHERE id = ?",
-                             (time.time() + self.INTER_HAND_SECONDS if game.street == "complete"
+                             (time.time() + self.INTER_HAND_SECONDS if
+                              game.street == "complete" and continuing
                               else None, room_id))
             return {"hand_id": game.hand_id, "hand_number": number,
                     "version": game.version, "to_act_index": game.to_act_index,
                     "status": game.street, "replayed": False}
 
-    @staticmethod
-    def _save_settlement(conn: sqlite3.Connection, game: HoldemGame) -> None:
+    def _save_settlement(self, conn: sqlite3.Connection, game: HoldemGame) -> None:
         for i, player in enumerate(game.players):
             conn.execute(
                 "UPDATE room_players SET stack = ? WHERE id = ?",
@@ -510,6 +698,18 @@ class PokerStore:
                 "WHERE hand_id = ? AND player_id = ?",
                 (player.stack, game.payouts[i], game.refunds[i], game.hand_id, player.player_id),
             )
+        room_id = conn.execute("SELECT room_id FROM hands WHERE id = ?",
+                               (game.hand_id,)).fetchone()["room_id"]
+        pending = conn.execute(
+            "SELECT id, pending_admin_action FROM room_players WHERE room_id = ? "
+            "AND is_active = 1 AND pending_admin_action IS NOT NULL ORDER BY seat",
+            (room_id,),
+        ).fetchall()
+        for row in pending:
+            self._apply_admin_action(conn, room_id, row["id"], row["pending_admin_action"])
+        if pending:
+            self._clear_confirmations(conn, room_id)
+        self._stop_if_insufficient(conn, room_id)
 
     def apply_action(self, room_id: str, hand_id: str, token: str, action: Action,
                      expected_version: int, request_id: str,
@@ -555,7 +755,8 @@ class PokerStore:
                         request_id: str, game: HoldemGame, room: sqlite3.Row,
                         deadline_seconds: int | None) -> None:
         if game.street != "complete" and (deadline_seconds is not None or
-                                          room["play_state"] == "running"):
+                                          room["play_state"] == "running" or
+                                          room["status"] == "closed"):
             game.start_clock(deadline_seconds if deadline_seconds is not None else
                              self._decision_seconds(room, game), time.time())
         record = game.history[-1]
@@ -576,7 +777,7 @@ class PokerStore:
         )
         if completed:
             self._save_settlement(conn, game)
-            if room["play_state"] == "running":
+            if self._room(conn, room["id"])["play_state"] == "running":
                 conn.execute("UPDATE rooms SET next_hand_at = ? WHERE id = ?",
                              (time.time() + self.INTER_HAND_SECONDS, room["id"]))
 
@@ -622,7 +823,7 @@ class PokerStore:
                       hand["id"]))
         if completed:
             self._save_settlement(conn, game)
-            if room["play_state"] == "running":
+            if self._room(conn, room["id"])["play_state"] == "running":
                 conn.execute("UPDATE rooms SET next_hand_at = ? WHERE id = ?",
                              (time.time() + self.INTER_HAND_SECONDS, room["id"]))
 
@@ -770,7 +971,8 @@ class PokerStore:
                 active_stacks = {p.player_id: p.stack for p in game.players}
             players = []
             for row in conn.execute(
-                "SELECT id, nickname, seat, stack, total_buyin, total_cashout, ready, start_confirmed "
+                "SELECT id, nickname, seat, stack, total_buyin, total_cashout, ready, "
+                "start_confirmed, pending_admin_action "
                 "FROM room_players WHERE room_id = ? AND is_active = 1 "
                 "ORDER BY seat IS NULL, seat, created_at", (room_id,)
             ):
@@ -779,6 +981,7 @@ class PokerStore:
                     "seat": row["seat"],
                     "ready": bool(row["ready"]),
                     "start_confirmed": bool(row["start_confirmed"]),
+                    "pending_admin_action": row["pending_admin_action"],
                     "stack": active_stacks.get(row["id"], row["stack"]),
                     "total_buyin": row["total_buyin"],
                     "total_cashout": row["total_cashout"],
@@ -798,6 +1001,11 @@ class PokerStore:
                 "SELECT nickname FROM allowed_nicknames WHERE room_id = ? ORDER BY nickname",
                 (room_id,),
             )]
+            admin_events = [dict(row) for row in conn.execute(
+                "SELECT e.action, e.created_at, p.nickname FROM room_admin_events e "
+                "LEFT JOIN room_players p ON p.id = e.player_id "
+                "WHERE e.room_id = ? ORDER BY e.rowid DESC LIMIT 10", (room_id,),
+            )]
             return {
                 "room_id": room_id, "small_blind": room["small_blind"],
                 "big_blind": room["big_blind"], "max_players": room["max_players"],
@@ -814,6 +1022,7 @@ class PokerStore:
                 "latest_hand_id": last["id"] if last else None,
                 "latest_hand_status": last["status"] if last else None,
                 "players": players, "leaderboard": leaderboard,
+                "admin_events": admin_events,
             }
 
     def list_rooms(self) -> list[dict]:
@@ -825,12 +1034,16 @@ class PokerStore:
                  "max_buyin_stack": row["max_buyin_stack"], "status": row["status"],
                  "play_state": row["play_state"],
                  "created_at": row["created_at"]}
-                for row in conn.execute("SELECT * FROM rooms ORDER BY created_at DESC")
+                for row in conn.execute(
+                    "SELECT * FROM rooms WHERE status = 'open' ORDER BY created_at DESC"
+                )
             ]
 
-    def public_room(self, room_id: str) -> dict:
+    def public_room(self, room_id: str, include_closed: bool = False) -> dict:
         """Room information suitable for anyone holding its invite link."""
         overview = self.room_overview(room_id)
+        if overview["status"] == "closed" and not include_closed:
+            return {"room_id": room_id, "status": "closed"}
         return {
             key: overview[key] for key in (
                 "room_id", "small_blind", "big_blind", "max_players",
@@ -843,7 +1056,8 @@ class PokerStore:
             "players": [
                 {"player_id": p["player_id"], "nickname": p["nickname"],
                  "seat": p["seat"], "stack": p["stack"],
-                 "ready": p["ready"], "start_confirmed": p["start_confirmed"]}
+                 "ready": p["ready"], "start_confirmed": p["start_confirmed"],
+                 "pending_admin_action": p["pending_admin_action"]}
                 for p in overview["players"]
             ], "leaderboard": overview["leaderboard"],
         }

@@ -39,7 +39,7 @@ class StorageTests(unittest.TestCase):
     def test_schema_identity_and_unique_seats(self):
         room_id, alice, bob = self.room()
         with closing(sqlite3.connect(self.path)) as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 4)
             stored = conn.execute("SELECT session_token_hash FROM room_players WHERE id = ?",
                                   (alice.player_id,)).fetchone()[0]
         self.assertNotEqual(stored, alice.session_token)
@@ -316,7 +316,7 @@ class StorageTests(unittest.TestCase):
             conn.commit()
         self.store.initialize()
         with closing(sqlite3.connect(self.path)) as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 4)
             self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
             self.assertEqual(conn.execute("SELECT player_id FROM hand_players").fetchone()[0], "p")
             self.assertEqual(conn.execute("SELECT seat FROM room_players WHERE id = 'p'").fetchone()[0], 0)
@@ -396,6 +396,157 @@ class StorageTests(unittest.TestCase):
         with self.assertRaises(InvalidAction):
             self.store.extend_decision(room_id, hand["hand_id"], alice.session_token,
                                        restored.version)
+
+    def test_archived_room_disappears_but_keeps_buyins_and_completed_hand(self):
+        room_id, alice, bob = self.room(first=100, second=100)
+        hand = self.store.start_hand(room_id, "archived-hand", deadline_seconds=30)
+        archived = self.store.archive_room(room_id)
+        self.assertTrue(archived["active_hand_finishing"])
+        self.assertEqual(self.store.list_rooms(), [])
+        self.assertEqual(self.store.public_room(room_id)["status"], "closed")
+        with self.assertRaises(Conflict):
+            self.store.join_player(room_id, "Carol")
+        with self.assertRaises(Conflict):
+            self.store.request_start(room_id)
+        with self.assertRaises(Conflict):
+            self.store.set_ready(room_id, alice.session_token, True)
+        self.store.apply_action(room_id, hand["hand_id"], alice.session_token,
+                                Action(ActionType.FOLD), hand["version"], "last-action")
+        self.assertEqual(self.store.load_game(room_id).street, "complete")
+        self.assertEqual(self.store.advance_rooms(time.time() + 10), [])
+        self.assertEqual(len(self.store.buyin_history(room_id, alice.session_token)), 1)
+        self.assertEqual(len(self.store.hand_history(room_id, alice.session_token)), 1)
+        self.assertTrue(self.store.archive_room(room_id)["replayed"])
+
+    def test_archiving_paused_hand_restores_clock_for_final_settlement(self):
+        room_id, alice, bob = self.room(first=100, second=100)
+        self.store.set_ready(room_id, alice.session_token, True)
+        self.store.set_ready(room_id, bob.session_token, True)
+        self.store.confirm_start(room_id, alice.session_token)
+        self.store.confirm_start(room_id, bob.session_token)
+        self.store.advance_rooms()
+        self.store.pause_room(room_id)
+        paused = self.store.load_game(room_id)
+        self.assertIsNone(paused.deadline_at)
+        self.store.archive_room(room_id)
+        resumed = self.store.load_game(room_id)
+        self.assertIsNotNone(resumed.deadline_at)
+        self.assertIsNone(resumed.paused_remaining)
+        self.assertEqual(self.store.expire_due_actions(resumed.deadline_at + 1, None), [room_id])
+        self.assertEqual(self.store.load_game(room_id).street, "complete")
+        self.assertIsNone(self.store.room_overview(room_id)["next_hand_at"])
+
+    def test_archived_hand_keeps_clock_until_every_decision_finishes(self):
+        room_id, alice, bob = self.room(first=100, second=100)
+        hand = self.store.start_hand(room_id, "archive-mid-hand")
+        self.store.archive_room(room_id)
+        armed = self.store.load_game(room_id)
+        self.assertIsNotNone(armed.deadline_at)
+        self.store.apply_action(room_id, hand["hand_id"], alice.session_token,
+                                Action(ActionType.CALL), armed.version, "archived-call")
+        self.assertIsNotNone(self.store.load_game(room_id).deadline_at)
+        for _ in range(8):
+            if self.store.load_game(room_id).street == "complete":
+                break
+            self.assertEqual(self.store.expire_due_actions(time.time() + 1000, None), [room_id])
+        self.assertEqual(self.store.load_game(room_id).street, "complete")
+        self.assertIsNone(self.store.room_overview(room_id)["next_hand_at"])
+
+    def test_recovery_rotates_token_without_changing_active_hand(self):
+        room_id, alice, bob = self.room(first=100, second=100)
+        hand = self.store.start_hand(room_id, "recover-active", deadline_seconds=60)
+        before = self.store.load_game(room_id)
+        first = self.store.issue_recovery_code(room_id, alice.player_id)
+        second = self.store.issue_recovery_code(room_id, alice.player_id)
+        with self.assertRaises(AccessDenied):
+            self.store.recover_player(room_id, first["code"])
+        restored = PokerStore(self.path).recover_player(room_id, second["code"])
+        self.assertEqual(restored.player_id, alice.player_id)
+        self.assertEqual(restored.seat, 0)
+        self.assertNotEqual(restored.session_token, alice.session_token)
+        with self.assertRaises(AccessDenied):
+            self.store.player_view(room_id, alice.session_token)
+        with self.assertRaises(AccessDenied):
+            self.store.recover_player(room_id, second["code"])
+        self.assertEqual(self.store.load_game(room_id).version, before.version)
+        self.assertEqual(self.store.load_game(room_id).deadline_at, before.deadline_at)
+        self.assertEqual(self.store.player_view(room_id, restored.session_token)["hand_id"], hand["hand_id"])
+        self.store.apply_action(room_id, hand["hand_id"], restored.session_token,
+                                Action(ActionType.FOLD), before.version, "recovered-fold")
+        self.assertEqual(self.store.load_game(room_id).street, "complete")
+        with closing(sqlite3.connect(self.path)) as conn:
+            self.assertNotIn(second["code"], " ".join(str(row) for row in conn.execute(
+                "SELECT code_hash FROM player_recovery_codes")))
+
+    def test_recovery_code_expires_and_admin_removal_revokes_it(self):
+        room_id, alice, bob = self.room(first=100, second=100)
+        expired = self.store.issue_recovery_code(room_id, alice.player_id)
+        with closing(sqlite3.connect(self.path)) as conn:
+            conn.execute("UPDATE player_recovery_codes SET expires_at = ? WHERE player_id = ?",
+                         (time.time() - 1, alice.player_id))
+            conn.commit()
+        with self.assertRaises(AccessDenied):
+            self.store.recover_player(room_id, expired["code"])
+        outstanding = self.store.issue_recovery_code(room_id, bob.player_id)
+        self.store.request_player_action(room_id, bob.player_id, "remove")
+        with self.assertRaises(AccessDenied):
+            self.store.recover_player(room_id, outstanding["code"])
+        with self.assertRaises(AccessDenied):
+            self.store.player_view(room_id, bob.session_token)
+        self.assertEqual(self.store.room_overview(room_id)["admin_events"][0]["action"], "remove_applied")
+
+    def test_admin_stand_and_remove_wait_for_settlement_and_conserve_chips(self):
+        room_id, alice, bob = self.room(first=100, second=100)
+        hand = self.store.start_hand(room_id, "queued-management")
+        self.assertTrue(self.store.request_player_action(room_id, alice.player_id, "stand")["queued"])
+        self.assertTrue(self.store.request_player_action(room_id, bob.player_id, "remove")["queued"])
+        self.assertTrue(self.store.request_player_action(room_id, bob.player_id, "remove")["replayed"])
+        self.assertEqual(self.store.room_overview(room_id)["players"][0]["pending_admin_action"], "stand")
+        self.assertEqual(self.store.player_view(room_id, bob.session_token)["hand_id"], hand["hand_id"])
+        self.store.apply_action(room_id, hand["hand_id"], alice.session_token,
+                                Action(ActionType.FOLD), hand["version"], "finish-before-removal")
+        alice_row = next(p for p in self.store.room_overview(room_id)["players"]
+                         if p["player_id"] == alice.player_id)
+        self.assertIsNone(alice_row["seat"])
+        self.assertEqual(alice_row["stack"], 99)
+        with self.assertRaises(AccessDenied):
+            self.store.player_view(room_id, bob.session_token)
+        with closing(sqlite3.connect(self.path)) as conn:
+            bob_row = conn.execute("SELECT stack, total_cashout FROM room_players WHERE id = ?",
+                                   (bob.player_id,)).fetchone()
+            settled = conn.execute("SELECT ending_stack FROM hand_players WHERE hand_id = ? "
+                                   "AND player_id = ?", (hand["hand_id"], bob.player_id)).fetchone()[0]
+        self.assertEqual(tuple(bob_row), (0, 101))
+        self.assertEqual(settled, 101)
+        self.assertEqual(alice_row["stack"] + bob_row[1], 200)
+        self.assertIn("stand_applied", [e["action"] for e in self.store.room_overview(room_id)["admin_events"]])
+
+    def test_admin_stand_between_hands_keeps_identity_and_stack(self):
+        room_id, alice, bob = self.room(first=100, second=100)
+        result = self.store.request_player_action(room_id, alice.player_id, "stand")
+        self.assertFalse(result["queued"])
+        row = next(p for p in self.store.room_overview(room_id)["players"]
+                   if p["player_id"] == alice.player_id)
+        self.assertIsNone(row["seat"])
+        self.assertEqual(row["stack"], 100)
+        self.assertEqual(self.store.take_seat(room_id, alice.session_token, 2)["stack"], 100)
+
+    def test_queued_removal_stops_auto_play_after_settlement(self):
+        room_id, alice, bob = self.room(first=100, second=100)
+        self.store.set_ready(room_id, alice.session_token, True)
+        self.store.set_ready(room_id, bob.session_token, True)
+        self.store.confirm_start(room_id, alice.session_token)
+        self.store.confirm_start(room_id, bob.session_token)
+        self.store.advance_rooms()
+        game = self.store.load_game(room_id)
+        self.assertEqual(self.store.room_overview(room_id)["play_state"], "running")
+        self.assertTrue(self.store.request_player_action(room_id, bob.player_id, "remove")["queued"])
+        self.store.apply_action(room_id, game.hand_id, alice.session_token,
+                                Action(ActionType.FOLD), game.version, "stop-after-remove")
+        overview = self.store.room_overview(room_id)
+        self.assertEqual(overview["play_state"], "waiting")
+        self.assertIsNone(overview["next_hand_at"])
+        self.assertEqual(self.store.advance_rooms(time.time() + 100), [])
 
 
 if __name__ == "__main__":

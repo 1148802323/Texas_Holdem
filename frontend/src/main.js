@@ -71,6 +71,22 @@ function notice(message, kind = 'error') {
   box.textContent = message;
 }
 
+async function copyInviteLink(url) {
+  try {
+    await navigator.clipboard.writeText(url);
+    notice('邀请链接已复制，可以发给朋友。', 'ok');
+  } catch {
+    const output = document.querySelector('#created');
+    if (output) {
+      output.replaceChildren(node('p', '复制未成功，请手动复制下面的链接。', 'muted small'));
+      const input = document.createElement('input');
+      input.value = url; input.readOnly = true; input.className = 'invite-input';
+      input.addEventListener('click', () => input.select());
+      output.append(input); input.select();
+    } else notice(`请手动复制邀请链接：${url}`);
+  }
+}
+
 async function api(path, options = {}) {
   const response = await fetch(path, {
     credentials: 'same-origin',
@@ -109,6 +125,9 @@ function renderHome() {
 async function renderAdmin() {
   try { await api('/api/admin/session'); } catch { return showAdminLogin(); }
   app.innerHTML = `<section class="hero compact"><div class="eyebrow">ROOM CONTROL</div><h1>牌局管理</h1><p>创建私人牌桌，设置规则并分享邀请链接。</p></section><div class="grid"><section class="panel"><h2>创建新牌局</h2><form id="create-room"><div class="row"><label class="field">小盲注<input name="sb" type="number" min="1" value="10" required></label><label class="field">大盲注<input name="bb" type="number" min="2" value="20" required></label></div><div class="row"><label class="field">牌桌人数<input name="seats" type="number" min="2" max="9" value="6" required></label><label class="field">买入后筹码上限<input name="cap" type="number" min="2" value="2000" required></label></div><div class="row"><label class="field">翻前秒数<input name="preflop" type="number" min="5" max="600" value="60" required></label><label class="field">翻牌秒数<input name="flop" type="number" min="5" max="600" value="60" required></label></div><div class="row"><label class="field">转牌秒数<input name="turn" type="number" min="5" max="600" value="120" required></label><label class="field">河牌秒数<input name="river" type="number" min="5" max="600" value="180" required></label></div><label class="field">全下发牌投票秒数<input name="vote" type="number" min="5" max="600" value="60" required></label><label class="field">指定可用昵称（选填，用逗号分隔）<textarea name="names" rows="2" placeholder="留空允许自由输入昵称"></textarea></label><button class="btn" type="submit">创建并生成邀请链接</button></form><div id="created"></div></section><section class="panel"><div class="row"><h2>我的牌局</h2><button id="logout" class="btn secondary mini right">退出管理</button></div><div id="rooms"></div></section></div>`;
+  const recoveryPanel = node('section', '', 'panel recovery-panel');
+  recoveryPanel.id = 'admin-recovery'; recoveryPanel.hidden = true;
+  app.append(recoveryPanel);
   document.querySelector('#create-room').addEventListener('submit', async event => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
@@ -124,10 +143,11 @@ async function renderAdmin() {
       }) });
       const output = document.querySelector('#created'); output.replaceChildren();
       output.append(node('div', '邀请链接已生成', 'notice ok'));
-      const link = node('a', result.invite_url, 'mono'); link.href = result.invite_url;
-      output.append(link);
+      const link = document.createElement('input'); link.value = result.invite_url;
+      link.readOnly = true; link.className = 'invite-input mono';
+      link.addEventListener('click', () => link.select()); output.append(link);
       const copy = node('button', '复制链接', 'btn secondary mini'); copy.type = 'button';
-      copy.addEventListener('click', () => navigator.clipboard.writeText(result.invite_url).then(() => notice('邀请链接已复制。', 'ok')));
+      copy.addEventListener('click', () => copyInviteLink(result.invite_url));
       output.append(node('div', ''));
       output.append(copy);
       await loadAdminRooms();
@@ -155,17 +175,70 @@ async function loadAdminRooms() {
   if (adminRoomsLoading) return;
   adminRoomsLoading = true;
   try {
-    const rooms = await api('/api/admin/rooms'); container.replaceChildren();
+    const rooms = await api('/api/admin/rooms');
+    const expandedEvents = new Set([...container.querySelectorAll('details.admin-events[open]')]
+      .map(details => details.dataset.roomId));
+    container.replaceChildren();
     if (!rooms.length) return container.append(node('p', '还没有牌局。', 'muted'));
     for (const room of rooms) {
       const overview = await api(`/api/admin/rooms/${room.room_id}`);
       const item = node('div', '', 'room-item'); const info = node('div');
       info.append(node('div', `牌局 ${room.room_id.slice(0, 8)}`, 'room-item-title'));
       info.append(node('p', `盲注 ${room.small_blind}/${room.big_blind} · ${room.max_players} 人 · 买入上限 ${money(room.max_buyin_stack)}`));
-      info.append(node('p', overview.players.length ? overview.players.map(p =>
-        `${p.nickname}：${money(p.stack)} 筹码 / 累计买入 ${money(p.total_buyin)}`).join(' · ') : '尚无人入座'));
+      info.append(node('p', overview.players.length ?
+        `${overview.players.length} 位玩家 · ${overview.players.filter(p => p.seat !== null).length} 人入座` : '尚无玩家'));
+      const playerList = node('div', '', 'admin-player-list');
+      for (const player of overview.players) {
+        const row = node('div', '', 'admin-player-row');
+        const identity = node('div', '', 'admin-player-info');
+        identity.append(node('strong', `${player.nickname} · ${player.seat === null ? '旁观' : `座位 ${player.seat + 1}`}`));
+        identity.append(node('span', `${money(player.stack)} 筹码 · ${player.ready ? '已准备' : '未准备'} · ${player.connected ? '在线' : '离线'}`, 'muted small'));
+        if (player.pending_admin_action) identity.append(node('span',
+          `本手结算后${player.pending_admin_action === 'stand' ? '离座' : '移出房间'}`, 'admin-pending'));
+        const actions = node('div', '', 'row');
+        const recovery = node('button', '生成恢复码', 'btn secondary mini'); recovery.type = 'button';
+        recovery.addEventListener('click', async () => {
+          if (!confirm(`为 ${player.nickname} 生成新的恢复码？之前未使用的恢复码将立即失效。`)) return;
+          try {
+            const result = await api(`/api/admin/rooms/${room.room_id}/players/${player.player_id}/recovery-code`, { method: 'POST' });
+            showRecoveryCode(result);
+            await loadAdminRooms();
+          } catch (error) { notice(error.message); }
+        });
+        actions.append(recovery);
+        for (const [action, title] of [['stand', '强制离座'], ['remove', '移出房间']]) {
+          if (action === 'stand' && player.seat === null) continue;
+          const control = node('button', title, `btn ${action === 'remove' ? 'danger' : 'secondary'} mini`);
+          control.type = 'button';
+          control.addEventListener('click', async () => {
+            const effect = action === 'stand' ? '座位会腾出，筹码仍归该昵称' : '凭证会失效，剩余筹码计入离桌兑出';
+            if (!confirm(`${title} ${player.nickname}？${effect}。如果他正在参与手牌，将在该手结算后执行。`)) return;
+            try {
+              const result = await api(`/api/admin/rooms/${room.room_id}/players/${player.player_id}/${action}`, { method: 'POST' });
+              notice(result.queued ? '已安排在本手结算后执行。' : '管理操作已执行。', 'ok');
+              await loadAdminRooms();
+            } catch (error) { notice(error.message); }
+          });
+          actions.append(control);
+        }
+        row.append(identity, actions); playerList.append(row);
+      }
+      info.append(playerList);
+      if (overview.admin_events?.length) {
+        const details = node('details', '', 'admin-events');
+        details.dataset.roomId = room.room_id;
+        details.open = expandedEvents.has(room.room_id);
+        details.append(node('summary', '最近管理记录'));
+        const names = { recovery_issued: '签发恢复码', recovery_used: '恢复身份',
+          stand_queued: '安排离座', stand_applied: '完成离座',
+          remove_queued: '安排移出', remove_applied: '完成移出', room_archived: '删除牌桌' };
+        for (const event of overview.admin_events) details.append(node('div',
+          `${new Date(event.created_at).toLocaleString('zh-CN')} · ${event.nickname || '牌桌'} · ${names[event.action] || event.action}`, 'small muted'));
+        info.append(details);
+      }
       const controls = node('div', '', 'row');
-      const link = node('a', '邀请链接', 'btn secondary mini'); link.href = `/r/${room.room_id}`;
+      const link = node('button', '复制邀请链接', 'btn secondary mini'); link.type = 'button';
+      link.addEventListener('click', () => copyInviteLink(`${location.origin}/r/${room.room_id}`));
       const start = node('button', '开始游戏', 'btn mini'); start.type = 'button';
       start.addEventListener('click', async () => {
         try {
@@ -183,12 +256,39 @@ async function loadAdminRooms() {
         catch (error) { notice(error.message); }
       });
       info.append(node('p', `状态：${({ waiting: '等待准备', running: '自动进行中', paused: '已暂停' })[overview.play_state]}`));
-      controls.append(link, start, pause, resume); item.append(info, controls); container.append(item);
+      const remove = node('button', '删除牌桌', 'btn danger mini'); remove.type = 'button';
+      remove.addEventListener('click', async () => {
+        if (!confirm(`删除牌桌 ${room.room_id.slice(0, 8)}？\n邀请链接将停用，牌桌会从管理列表移除；买入和手牌记录仍保留。正在进行的手牌会结算完，但不再开下一手。`)) return;
+        try {
+          await api(`/api/admin/rooms/${room.room_id}`, { method: 'DELETE' });
+          notice('牌桌已删除，历史记录已保留。', 'ok');
+          await loadAdminRooms();
+        } catch (error) { notice(error.message); }
+      });
+      controls.append(link, start, pause, resume, remove); item.append(info, controls); container.append(item);
     }
   } catch (error) { notice(error.message); }
   finally { adminRoomsLoading = false; }
 }
 setInterval(() => { if (location.pathname === '/admin' && document.querySelector('#rooms')) loadAdminRooms(); }, 3000);
+
+function showRecoveryCode(result) {
+  const panel = document.querySelector('#admin-recovery'); if (!panel) return;
+  panel.hidden = false; panel.replaceChildren();
+  panel.append(node('h2', `${result.nickname} 的一次性恢复码`));
+  panel.append(node('p', `请私下交给本人。有效期至 ${new Date(result.expires_at * 1000).toLocaleString('zh-CN')}，使用一次或再次生成后即失效。`));
+  const input = document.createElement('input'); input.value = result.code;
+  input.readOnly = true; input.className = 'invite-input mono';
+  input.addEventListener('click', () => input.select()); panel.append(input);
+  const copy = node('button', '复制恢复码', 'btn mini'); copy.type = 'button';
+  copy.addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText(result.code); notice('恢复码已复制。', 'ok'); }
+    catch { input.select(); notice('复制未成功，请手动复制已选中的恢复码。'); }
+  });
+  const close = node('button', '关闭显示', 'btn secondary mini'); close.type = 'button';
+  close.addEventListener('click', () => { panel.replaceChildren(); panel.hidden = true; });
+  const controls = node('div', '', 'row'); controls.append(copy, close); panel.append(controls);
+}
 
 async function enterRoom() {
   try {
@@ -200,9 +300,12 @@ async function enterRoom() {
     refreshHistoryIfNeeded();
   } catch (error) {
     if (error.status === 401) {
+      const wasJoined = roomJoined;
       roomJoined = false;
       if (socket) { socket.close(); socket = null; }
-      return renderJoin(roomData);
+      renderJoin(roomData);
+      if (wasJoined) notice('此设备的玩家凭证已失效；可以使用管理员提供的恢复码找回原身份。');
+      return;
     }
     app.innerHTML = ''; notice(error.message);
   }
@@ -210,7 +313,31 @@ async function enterRoom() {
 
 function renderJoin(room) {
   if (!room) return;
+  if (room.status !== 'open') {
+    app.innerHTML = '<section class="hero compact"><h1>牌桌已关闭</h1><p>这个邀请链接已停用，无法再加入。</p></section>';
+    return;
+  }
   app.innerHTML = `<section class="hero compact"><div class="eyebrow">YOU ARE INVITED</div><h1>加入私人牌桌</h1><p>先设置昵称进入旁观区，点击空座位上的加号即可入座。</p></section><div class="grid"><section class="panel"><h2>设置昵称</h2><form id="join-form"><div id="name-field"></div><button class="btn" type="submit">进入牌桌 →</button></form></section><section class="panel"><h2>牌局设置</h2><div class="statbar"><span class="pill">盲注 <strong>${room.small_blind}/${room.big_blind}</strong></span><span class="pill">人数 <strong>${room.max_players}</strong></span><span class="pill">买入上限 <strong>${money(room.max_buyin_stack)}</strong></span></div><p>昵称在房间中唯一。旁观时不能买入；入座后可以在两手牌之间买入。</p><div id="joined"></div></section></div>`;
+  const recoveryPanel = node('section', '', 'panel');
+  recoveryPanel.append(node('h2', '恢复原来的玩家身份'));
+  recoveryPanel.append(node('p', '换设备或浏览器数据丢失时，请向房主领取一次性恢复码。昵称本身不能找回筹码和手牌记录。'));
+  const recoveryForm = document.createElement('form'); recoveryForm.id = 'recover-form';
+  const recoveryLabel = node('label', '一次性恢复码', 'field');
+  const recoveryInput = document.createElement('input'); recoveryInput.name = 'code';
+  recoveryInput.required = true; recoveryInput.autocomplete = 'off'; recoveryInput.minLength = 8;
+  recoveryLabel.append(recoveryInput);
+  const recoverySubmit = node('button', '恢复身份', 'btn'); recoverySubmit.type = 'submit';
+  recoveryForm.append(recoveryLabel, recoverySubmit); recoveryPanel.append(recoveryForm);
+  document.querySelector('.grid').append(recoveryPanel);
+  recoveryForm.addEventListener('submit', async event => {
+    event.preventDefault();
+    try {
+      await api(`/api/rooms/${roomId}/recover`, { method: 'POST',
+        body: JSON.stringify({ code: recoveryInput.value.trim() }) });
+      historyData = null; historyKey = ''; historyViewerId = null;
+      await enterRoom(); notice('已恢复原身份、筹码和历史记录。', 'ok');
+    } catch (error) { notice(error.message); }
+  });
   const nameField = document.querySelector('#name-field');
   if (room.nickname_policy === 'preset') {
     const label = node('label', '选择昵称', 'field'); const select = node('select'); select.name = 'nickname';
@@ -254,7 +381,7 @@ function connectSocket() {
   connection.onclose = () => {
     if (socket !== connection) return;
     socket = null;
-    setTimeout(() => { if (roomJoined) connectSocket(); }, 2500);
+    setTimeout(() => { if (roomJoined) enterRoom(); }, 2500);
   };
 }
 
@@ -270,6 +397,7 @@ function positionAtTable(element, position, count, dealer = false) {
 function renderRoom(payload) {
   roomData = payload.room;
   const room = payload.room, game = payload.game;
+  const closed = room.status !== 'open';
   currentGame = game;
   currentHistoryKey = `${game.viewer_player_id || game.player_id}:${game.hand_id || ''}:${game.version || 0}`;
   const active = game.street && game.street !== 'complete';
@@ -289,6 +417,8 @@ function renderRoom(payload) {
   const previousTableScroll = document.querySelector('.table-scroll')?.scrollLeft;
   const seatedCount = room.players.filter(p => p.seat !== null).length;
   app.innerHTML = `<section class="hero compact room-heading"><div><div class="eyebrow">PRIVATE TABLE · ${room.room_id.slice(0, 8)}</div><h1>朋友牌局</h1><p>盲注 ${room.small_blind}/${room.big_blind} · 买入上限 ${money(room.max_buyin_stack)} · ${seatedCount}/${room.max_players} 人入座</p></div><div class="room-identity"><span id="identity-name"></span><span id="identity-seat"></span><button id="leave-room" class="btn secondary mini" type="button">退出牌桌</button></div></section><div class="room-layout"><aside class="panel profit-panel"><h2>玩家盈亏</h2><p class="muted small">已结算筹码 − 累计买入；离桌筹码计入兑出。</p><div id="profit-list"></div><div class="rule"></div><h3>旁观者</h3><div id="spectator-list"></div></aside><div class="table-column"><div class="table-scroll"><section class="table-wrap"><div class="table-felt"></div><div class="table-top"><span id="street"></span><span id="turn"></span></div><div class="table-center"><div id="board" class="board"></div><div class="pot">总底池<b id="pot">0</b></div></div><div id="seats" class="seats"></div></section></div><p class="scroll-hint">左右滑动牌桌可查看所有座位</p><section class="panel control-panel"><div class="control-header"><div><h2>我的位置与筹码</h2><p id="seat-help" class="muted small"></p></div><div class="stack-number"><span>当前筹码</span><strong id="my-stack"></strong></div></div><div id="seat-controls" class="row"></div><div id="buyin-area"></div><div class="rule"></div><h2>我的操作</h2><div id="action-area"></div></section><section class="panel action-panel"><h2>本手行动</h2><div id="action-history" class="history-list"></div></section></div><aside class="panel records-panel"><div class="row"><h2>我的手牌记录</h2><button id="history-refresh" class="btn secondary mini right" type="button">刷新</button></div><label class="field">查找手牌<input id="history-search" type="search" placeholder="输入手牌编号或牌面"></label><div id="history-content"><p class="muted small">正在载入你的记录…</p></div></aside></div>`;
+  if (closed) document.querySelector('.room-heading').after(node('div',
+    active ? '牌桌已关闭：当前手会结算完，之后不再开局。' : '牌桌已关闭：邀请已停用，历史记录仍可查看。', 'notice'));
   const tableScroll = document.querySelector('.table-scroll');
   if (tableScroll.scrollWidth > tableScroll.clientWidth) {
     tableScroll.scrollLeft = previousTableScroll ?? (tableScroll.scrollWidth - tableScroll.clientWidth) / 2;
@@ -344,7 +474,7 @@ function renderRoom(payload) {
       const plus = node('button', '+', 'seat-plus'); plus.type = 'button';
       plus.title = `坐到座位 ${position + 1}`;
       plus.setAttribute('aria-label', plus.title);
-      plus.disabled = lockedInHand;
+      plus.disabled = lockedInHand || closed;
       plus.addEventListener('click', () => takeSeat(position));
       item.append(plus, node('div', '点击入座', 'seat-name'));
     } else {
@@ -354,6 +484,8 @@ function renderRoom(payload) {
       if (game.street === 'runout_vote' && game.runout_votes?.[person.player_id]) {
         item.append(node('span', `已选发${game.runout_votes[person.player_id] === 'twice' ? '两次' : '一次'}`, 'confirm-badge'));
       }
+      if (person.pending_admin_action) item.append(node('span',
+        `本手后${person.pending_admin_action === 'stand' ? '离座' : '退出'}`, 'pending-seat-badge'));
     }
     if (person) {
       const stack = money(active ? state?.stack ?? person.stack : person.stack);
@@ -391,8 +523,8 @@ function renderRoom(payload) {
   const spectators = room.players.filter(p => p.seat === null);
   document.querySelector('#spectator-list').textContent = spectators.length ? spectators.map(p => p.nickname).join(' · ') : '暂无旁观者';
   document.querySelector('#my-stack').textContent = money(active && me ? me.stack : roomMe?.stack ?? game.stack ?? 0);
-  document.querySelector('#seat-help').textContent = seated ? '筹码与你的昵称绑定。手牌进行中不能换座或离桌。' : '正在旁观。点击任意空座位上的加号入座。';
-  if (seated) {
+  document.querySelector('#seat-help').textContent = closed ? '牌桌已关闭，不能再入座或买入。' : seated ? '筹码与你的昵称绑定。手牌进行中不能换座或离桌。' : '正在旁观。点击任意空座位上的加号入座。';
+  if (seated && !closed) {
     const stand = node('button', '站起旁观', 'btn secondary mini'); stand.type = 'button';
     stand.disabled = lockedInHand;
     stand.addEventListener('click', async () => {
@@ -445,6 +577,7 @@ async function takeSeat(position) {
 
 function renderBuyin(room, game, roomMe) {
   const area = document.querySelector('#buyin-area');
+  if (room.status !== 'open') return;
   if (roomMe?.seat === null || roomMe?.seat === undefined) {
     area.append(node('p', '入座后才能买入筹码。', 'muted small')); return;
   }
@@ -473,9 +606,11 @@ function renderBuyin(room, game, roomMe) {
 
 function renderActions(game, me) {
   const area = document.querySelector('#action-area');
-  if (game.status === 'watching') return area.append(node('p', '正在旁观。这手牌结束后，如果你已入座并买入筹码，就能参加下一手。', 'muted'));
-  if (!game.hand_id) return area.append(node('p', roomData.play_state === 'running' ? '玩家已确认，即将发牌。' : '等待入座玩家准备并确认开局。', 'muted'));
-  if (game.street === 'complete') return area.append(node('p', roomData.play_state === 'running' ? '本手已结算，即将自动开始下一手。' : '本手已结算，等待开局。', 'muted'));
+  if (game.status === 'watching') return area.append(node('p', roomData.status !== 'open' ?
+    '牌桌已关闭，可以查看自己曾参与的手牌记录。' : '正在旁观。这手牌结束后，如果你已入座并买入筹码，就能参加下一手。', 'muted'));
+  if (!game.hand_id) return area.append(node('p', roomData.status !== 'open' ?
+    '牌桌已关闭。' : roomData.play_state === 'running' ? '玩家已确认，即将发牌。' : '等待入座玩家准备并确认开局。', 'muted'));
+  if (game.street === 'complete') return area.append(node('p', roomData.status !== 'open' ? '本手已结算，牌桌已关闭。' : roomData.play_state === 'running' ? '本手已结算，即将自动开始下一手。' : '本手已结算，等待开局。', 'muted'));
   if (game.street === 'runout_vote') {
     area.append(node('p', '入池玩家选择发一次或发两次。每个底池由有资格争夺该池的玩家共同决定；超时视为选择一次。', 'muted small'));
     if (game.runout_can_vote && roomData.play_state !== 'paused') {

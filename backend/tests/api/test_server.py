@@ -203,6 +203,70 @@ class BrowserApiTests(unittest.TestCase):
         self.assertIn("allin", manifest.json())
         self.client.cookies.set(cookie_name, bob_cookie)
 
+    def test_admin_can_delete_room_without_erasing_its_records(self):
+        room_id = self.create_room()
+        self.client.post(f"/api/rooms/{room_id}/join", json={"nickname": "Alice", "seat": 0})
+        self.client.post(f"/api/rooms/{room_id}/buyins",
+                         json={"amount": 100, "request_id": "archive-buyin"})
+        self.client.cookies.delete("th_admin")
+        self.assertEqual(self.client.delete(f"/api/admin/rooms/{room_id}").status_code, 401)
+        self.client.post("/api/admin/login", json={"password": "test-admin-password"})
+        deleted = self.client.delete(f"/api/admin/rooms/{room_id}")
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertEqual(self.client.get("/api/admin/rooms").json(), [])
+        closed_invite = self.client.get(f"/api/rooms/{room_id}").json()
+        self.assertEqual(closed_invite["status"], "closed")
+        self.assertNotIn("players", closed_invite)
+        self.assertEqual(self.client.get(f"/api/rooms/{room_id}/state").json()["room"]["players"][0]["nickname"], "Alice")
+        self.assertEqual(self.client.get(f"/api/admin/rooms/{room_id}").json()["players"][0]["total_buyin"], 100)
+        self.assertEqual(self.client.post(f"/api/rooms/{room_id}/join",
+                         json={"nickname": "Bob"}).status_code, 409)
+        self.assertTrue(self.client.delete(f"/api/admin/rooms/{room_id}").json()["replayed"])
+
+    def test_recovery_cookie_rotation_and_admin_player_controls(self):
+        room_id = self.create_room()
+        cookie_name = f"th_room_{room_id}"
+        joined = self.client.post(f"/api/rooms/{room_id}/join",
+                                  json={"nickname": "Alice", "seat": 0}).json()
+        old_cookie = self.client.cookies.get(cookie_name)
+        self.client.post(f"/api/rooms/{room_id}/buyins",
+                         json={"amount": 100, "request_id": "recovery-buyin"})
+        player_id = joined["player_id"]
+        self.client.cookies.delete("th_admin")
+        self.assertEqual(self.client.post(
+            f"/api/admin/rooms/{room_id}/players/{player_id}/recovery-code").status_code, 401)
+        self.client.post("/api/admin/login", json={"password": "test-admin-password"})
+        issued = self.client.post(
+            f"/api/admin/rooms/{room_id}/players/{player_id}/recovery-code").json()
+        self.assertEqual(issued["nickname"], "Alice")
+        self.client.cookies.delete(cookie_name)
+        recovered = self.client.post(f"/api/rooms/{room_id}/recover",
+                                     json={"code": issued["code"]})
+        self.assertEqual(recovered.status_code, 200, recovered.text)
+        self.assertEqual(recovered.json()["player_id"], player_id)
+        self.assertIn("httponly", recovered.headers["set-cookie"].lower())
+        new_cookie = self.client.cookies.get(cookie_name)
+        self.assertNotEqual(old_cookie, new_cookie)
+        self.assertEqual(self.client.get(f"/api/rooms/{room_id}/state").status_code, 200)
+        self.client.cookies.set(cookie_name, old_cookie)
+        self.assertEqual(self.client.get(f"/api/rooms/{room_id}/state").status_code, 401)
+        self.assertEqual(self.client.post(f"/api/rooms/{room_id}/recover",
+                         json={"code": issued["code"]}).status_code, 401)
+        self.client.cookies.set(cookie_name, new_cookie)
+        with self.client.websocket_connect(f"/ws/rooms/{room_id}") as socket:
+            self.assertEqual(socket.receive_json()["type"], "state")
+            overview = self.client.get(f"/api/admin/rooms/{room_id}").json()
+            self.assertTrue(overview["players"][0]["connected"])
+        overview = self.client.get(f"/api/admin/rooms/{room_id}").json()
+        self.assertFalse(overview["players"][0]["connected"])
+        stood = self.client.post(f"/api/admin/rooms/{room_id}/players/{player_id}/stand")
+        self.assertFalse(stood.json()["queued"])
+        self.assertEqual(self.client.get(f"/api/admin/rooms/{room_id}").json()["players"][0]["stack"], 100)
+        removed = self.client.post(f"/api/admin/rooms/{room_id}/players/{player_id}/remove")
+        self.assertFalse(removed.json()["queued"])
+        self.assertEqual(self.client.get(f"/api/rooms/{room_id}/state").status_code, 401)
+        self.assertEqual(self.client.get(f"/api/admin/rooms/{room_id}").json()["admin_events"][0]["action"], "remove_applied")
+
 
 if __name__ == "__main__":
     unittest.main()

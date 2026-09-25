@@ -74,6 +74,10 @@ class VoteBody(VersionBody):
     choice: StrictStr
 
 
+class RecoveryBody(BaseModel):
+    code: StrictStr
+
+
 class ActionBody(BaseModel):
     action: ActionType
     amount: StrictInt = 0
@@ -88,7 +92,7 @@ class RoomHub:
 
     async def send_state(self, room_id: str, socket: WebSocket, token: str) -> None:
         room, game = await asyncio.gather(
-            asyncio.to_thread(self.store.public_room, room_id),
+            asyncio.to_thread(self.store.public_room, room_id, True),
             asyncio.to_thread(self.store.player_view, room_id, token),
         )
         await socket.send_json({"type": "state", "room": room, "game": game})
@@ -113,6 +117,7 @@ def create_app(db_path: str | Path | None = None, admin_password: str | None = N
     store.initialize()
     hub = RoomHub(store)
     login_failures: dict[str, list[float]] = {}
+    recovery_failures: dict[str, list[float]] = {}
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -238,7 +243,37 @@ def create_app(db_path: str | Path | None = None, admin_password: str | None = N
 
     @app.get("/api/admin/rooms/{room_id}", dependencies=[Depends(require_admin)])
     async def admin_room(room_id: str):
-        return await asyncio.to_thread(store.room_overview, room_id)
+        overview = await asyncio.to_thread(store.room_overview, room_id)
+        tokens = [token for _, token in hub.clients.get(room_id, ())]
+        connected = await asyncio.to_thread(store.connected_player_ids, room_id, tokens)
+        for player in overview["players"]:
+            player["connected"] = player["player_id"] in connected
+        return overview
+
+    @app.post("/api/admin/rooms/{room_id}/players/{player_id}/recovery-code",
+              dependencies=[Depends(require_admin)])
+    async def issue_recovery_code(room_id: str, player_id: str):
+        return await asyncio.to_thread(store.issue_recovery_code, room_id, player_id)
+
+    @app.post("/api/admin/rooms/{room_id}/players/{player_id}/stand",
+              dependencies=[Depends(require_admin)])
+    async def force_stand(room_id: str, player_id: str):
+        result = await asyncio.to_thread(store.request_player_action, room_id, player_id, "stand")
+        await hub.broadcast(room_id)
+        return result
+
+    @app.post("/api/admin/rooms/{room_id}/players/{player_id}/remove",
+              dependencies=[Depends(require_admin)])
+    async def remove_player(room_id: str, player_id: str):
+        result = await asyncio.to_thread(store.request_player_action, room_id, player_id, "remove")
+        await hub.broadcast(room_id)
+        return result
+
+    @app.delete("/api/admin/rooms/{room_id}", dependencies=[Depends(require_admin)])
+    async def delete_room(room_id: str):
+        result = await asyncio.to_thread(store.archive_room, room_id)
+        await hub.broadcast(room_id)
+        return result
 
     @app.post("/api/admin/rooms/{room_id}/hands", dependencies=[Depends(require_admin)])
     async def start_hand(room_id: str, body: StartBody):
@@ -279,6 +314,26 @@ def create_app(db_path: str | Path | None = None, admin_password: str | None = N
         await hub.broadcast(room_id)
         return {"player_id": access.player_id, "nickname": access.nickname, "seat": access.seat}
 
+    @app.post("/api/rooms/{room_id}/recover")
+    async def recover(room_id: str, body: RecoveryBody, request: Request, response: Response):
+        address = request.client.host if request.client else "unknown"
+        now = time.monotonic()
+        recent = [attempt for attempt in recovery_failures.get(address, []) if now - attempt < 300]
+        recovery_failures[address] = recent
+        if len(recent) >= 10:
+            raise HTTPException(status_code=429, detail="Too many recovery attempts; try again later")
+        try:
+            access = await asyncio.to_thread(store.recover_player, room_id, body.code)
+        except AccessDenied:
+            recent.append(now)
+            raise
+        recovery_failures.pop(address, None)
+        response.set_cookie(f"th_room_{room_id}", access.session_token,
+                            httponly=True, secure=request.url.scheme == "https",
+                            samesite="lax", path="/")
+        await hub.broadcast(room_id)
+        return {"player_id": access.player_id, "nickname": access.nickname, "seat": access.seat}
+
     @app.post("/api/rooms/{room_id}/seat")
     async def take_seat(room_id: str, body: SeatBody, request: Request):
         result = await asyncio.to_thread(store.take_seat, room_id,
@@ -305,7 +360,7 @@ def create_app(db_path: str | Path | None = None, admin_password: str | None = N
     async def state(room_id: str, request: Request):
         token = player_token(request, room_id)
         room, game = await asyncio.gather(
-            asyncio.to_thread(store.public_room, room_id),
+            asyncio.to_thread(store.public_room, room_id, True),
             asyncio.to_thread(store.player_view, room_id, token),
         )
         return {"room": room, "game": game}
@@ -359,7 +414,7 @@ def create_app(db_path: str | Path | None = None, admin_password: str | None = N
     @app.get("/api/audio-manifest")
     async def audio_manifest():
         directory = FRONTEND / "src" / "audio"
-        pattern = re.compile(r"^(check|bet|raise|call|fold|allin|turn)[1-9]\d*\.(mp3|wav|ogg|m4a)$", re.I)
+        pattern = re.compile(r"^(check|bet|raise|call|fold|allin|turn)(?:[1-9]\d*|\([1-9]\d*\))?\.(mp3|wav|ogg|m4a)$", re.I)
         return {category: [f"/assets/audio/{path.name}" for path in sorted(directory.iterdir())
                            if path.is_file() and pattern.fullmatch(path.name) and
                            path.name.lower().startswith(category)]

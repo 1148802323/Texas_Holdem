@@ -99,4 +99,17 @@
 @keyframes extend-pulse{to{box-shadow:0 0 0 7px #f1a7563d}}
 .second-board{display:flex;gap:3px;align-items:center;color:#fff3da}
 .second-board .playing-card{width:26px;height:35px;font-size:11px}
+.invite-input{display:block;width:100%;max-width:100%;margin:10px 0;padding:9px 12px;border:1px solid #ffffff30;border-radius:9px;background:#071e1b;color:#f3faf6}
+.room-item>div:first-child{flex:1;min-width:0}
+.admin-player-list{display:grid;gap:8px;margin:12px 0}
+.admin-player-row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px;border:1px solid #ffffff25;border-radius:10px;background:#071e1b70}
+.admin-player-info{display:grid;gap:3px;min-width:0}
+.admin-player-info strong{overflow:hidden;text-overflow:ellipsis}
+.admin-pending{font-size:11px;color:#f2ce8e;font-weight:800}
+.admin-events{margin-top:10px;color:#bcd4c7;font-size:12px}
+.admin-events summary{cursor:pointer;margin-bottom:8px}
+.admin-events div{padding:3px 0}
+.recovery-panel{margin-top:20px;border-color:#e3c18380}
+.pending-seat-badge{position:absolute;left:-5px;bottom:-8px;border-radius:999px;padding:2px 5px;background:#e8ab82;color:#342114;font-size:9px;font-weight:900;white-space:nowrap}
+@media(max-width:900px){.admin-player-row{align-items:start;flex-direction:column}.pending-seat-badge{font-size:7px;padding:1px 3px}}
 @media(max-width:900px){.public-clock{width:125px;font-size:8px;padding:3px 5px}.public-clock-track{height:4px;margin-top:2px}.ready-badge,.confirm-badge{font-size:7px;padding:1px 3px}.second-board .playing-card{width:16px;height:22px;font-size:7px}.second-board span{font-size:8px}}
