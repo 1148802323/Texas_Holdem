@@ -19,7 +19,7 @@ D:\miniconda\envs\Texas_Holdem\python.exe -m uvicorn backend.app.api.server:crea
 
 然后访问 `http://127.0.0.1:8000/admin`。管理员创建房间后，页面会给出 `/r/<room_id>` 邀请链接。玩家无需账号，先选择昵称进入旁观区，再点击空座位上的加号入座。浏览器用 `HttpOnly` Cookie 保存房间身份。刷新页面后再次请求最新状态，并重新连接 WebSocket。
 
-默认数据库在 `database/holdem.sqlite3`，可通过 `TEXAS_DB_PATH` 指向别的文件。数据库文件包含未公开底牌，不应放到公开的静态文件目录。
+默认数据库在 `database/texas_holdem.sqlite3`，可通过 `TEXAS_DB_PATH` 指向别的文件。升级已有环境时，应先停服，再将 `database/holdem.sqlite3` 改名为 `database/texas_holdem.sqlite3`；已经通过 `TEXAS_DB_PATH` 指定路径的环境无需改名。数据库文件包含未公开底牌，不应放到公开的静态文件目录。服务器部署的路径和备份方法见 [部署与备份准备](deployment.md)。
 
 ## 当前流程
 
@@ -44,7 +44,7 @@ D:\miniconda\envs\Texas_Holdem\python.exe -m uvicorn backend.app.api.server:crea
 - 手机端牌桌采用纵向椭圆并缩小卡牌和座位，桌面区域无需横向滑动；盈亏和个人记录仍排列在牌桌下方。
 - 邀请朋友从公网访问之前，需要提供 HTTPS/WSS、可达的主机和备份方案。当前命令只在本机开放，尚未部署公网服务。
 - 在线状态根据当前 WebSocket 连接判断，连接中断后管理页会显示离线。恢复码应由管理员私下交给对应玩家；获得该码的人能接管该玩家身份。
-- 买入审批尚未实现；从旧版启动时，数据库自动迁移到 v4 结构。重启已有的服务进程后才会执行迁移。升级前可先备份 `database/holdem.sqlite3`。
+- 买入审批尚未实现；从旧版启动时，数据库自动迁移到 v4 结构。重启已有的服务进程后才会执行迁移。升级前可先备份 `database/texas_holdem.sqlite3`。
 
 ## 验证
 

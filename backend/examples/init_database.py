@@ -11,8 +11,8 @@ from backend.app.services.storage import PokerStore
 def main() -> None:
     parser = argparse.ArgumentParser(description="Initialize the poker database")
     parser.add_argument(
-        "--path", type=Path, default=Path("database/holdem.sqlite3"),
-        help="SQLite file path (default: database/holdem.sqlite3)",
+        "--path", type=Path, default=Path("database/texas_holdem.sqlite3"),
+        help="SQLite file path (default: database/texas_holdem.sqlite3)",
     )
     args = parser.parse_args()
     store = PokerStore(args.path)

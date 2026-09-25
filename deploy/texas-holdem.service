@@ -1,0 +1,23 @@
+[Unit]
+Description=Texas Hold'em private table
+After=network.target
+
+[Service]
+Type=simple
+User=texas-holdem
+Group=texas-holdem
+WorkingDirectory=/opt/texas-holdem
+EnvironmentFile=/etc/texas-holdem/texas-holdem.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/texas-holdem/.venv/bin/python -m uvicorn backend.app.api.server:create_app --factory --host 127.0.0.1 --port 8000 --workers 1 --proxy-headers --forwarded-allow-ips 127.0.0.1
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/texas-holdem
+
+[Install]
+WantedBy=multi-user.target

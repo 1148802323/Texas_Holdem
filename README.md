@@ -10,6 +10,8 @@
 
 **运行网页牌桌：**按 [网页运行说明](docs/web.md) 设置管理员密码并启动服务，访问 `http://127.0.0.1:8000/admin`。
 
+域名和服务器准备好之前，可先按 [部署与备份准备](docs/deployment.md) 检查单进程部署模板、在线备份和恢复演练。
+
 ## 目录职责
 
 ```text
@@ -94,8 +96,8 @@ private_snapshot = game.export_private_snapshot()  # 只供服务端持久化
 D:\miniconda\envs\Texas_Holdem\python.exe -B -X utf8 -m backend.examples.init_database
 ```
 
-默认生成 `database/holdem.sqlite3`，该文件在 `.gitignore` 中，不会被提交。数据库迁移脚本会随代码进入 Git。
+默认生成 `database/texas_holdem.sqlite3`，该文件在 `.gitignore` 中，不会被提交。数据库迁移脚本会随代码进入 Git。已有 `database/holdem.sqlite3` 的环境应在停服后将原文件改名为新文件名，以保留现有牌局数据。
 
 ## 下一步
 
-完善管理员操作、跨设备恢复与公网部署。详细顺序见 [开发计划](docs/development-plan.md)，已确认范围见 [需求说明](docs/requirements.md)。
+完成部署演练后，再配置域名、服务器及公网联机验收。详细顺序见 [开发计划](docs/development-plan.md)，已确认范围见 [需求说明](docs/requirements.md)。

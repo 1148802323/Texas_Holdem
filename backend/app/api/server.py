@@ -113,7 +113,7 @@ def create_app(db_path: str | Path | None = None, admin_password: str | None = N
     password = admin_password if admin_password is not None else os.environ.get("TEXAS_ADMIN_PASSWORD")
     if not password or len(password) < 12:
         raise RuntimeError("Set TEXAS_ADMIN_PASSWORD to at least 12 characters")
-    store = PokerStore(db_path or os.environ.get("TEXAS_DB_PATH", ROOT / "database/holdem.sqlite3"))
+    store = PokerStore(db_path or os.environ.get("TEXAS_DB_PATH", ROOT / "database/texas_holdem.sqlite3"))
     store.initialize()
     hub = RoomHub(store)
     login_failures: dict[str, list[float]] = {}

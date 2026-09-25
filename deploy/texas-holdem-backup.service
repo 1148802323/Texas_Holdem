@@ -1,0 +1,17 @@
+[Unit]
+Description=Backup Texas Hold'em SQLite database
+
+[Service]
+Type=oneshot
+User=texas-holdem
+Group=texas-holdem
+WorkingDirectory=/opt/texas-holdem
+EnvironmentFile=/etc/texas-holdem/texas-holdem.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/texas-holdem/.venv/bin/python -B -m deploy.sqlite_data backup
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/backups/texas-holdem

@@ -1,0 +1,5 @@
+# Replace the hostname after registering a domain and pointing DNS at the server.
+# Caddy terminates HTTPS and proxies HTTP + WebSocket traffic to local Uvicorn.
+poker.example.com {
+    reverse_proxy 127.0.0.1:8000
+}
