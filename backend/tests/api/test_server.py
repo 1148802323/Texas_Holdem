@@ -50,12 +50,13 @@ class BrowserApiTests(unittest.TestCase):
     def test_admin_auth_join_cookie_reconnect_and_private_websocket(self):
         page = self.client.get("/admin")
         self.assertEqual(page.status_code, 200)
-        self.assertIn('/assets/main.js?v=0.8.3', page.text)
+        self.assertIn('/assets/main.js?v=20260927-layout', page.text)
         self.assertEqual(page.headers["Cache-Control"], "no-store")
-        script = self.client.get("/assets/main.js?v=0.8.3")
+        script = self.client.get("/assets/main.js?v=20260927-layout")
         self.assertEqual(script.status_code, 200)
         self.assertEqual(script.headers["Cache-Control"], "no-cache")
-        self.assertEqual(self.client.get("/assets/styles/app.css?v=0.8.3").status_code, 200)
+        self.assertEqual(self.client.get("/assets/styles/app.css?v=20260927-layout").status_code, 200)
+        self.assertIn("deal", self.client.get("/api/audio-manifest").json())
         self.assertEqual(self.client.get("/api/admin/rooms").status_code, 401)
         room_id = self.create_room()
         self.assertEqual(self.client.get(f"/r/{room_id}").status_code, 200)
@@ -68,6 +69,7 @@ class BrowserApiTests(unittest.TestCase):
         cookie_name = f"th_room_{room_id}"
         alice_cookie = self.client.cookies.get(cookie_name)
         self.assertIn("httponly", joined.headers["set-cookie"].lower())
+        self.assertIn("max-age=2592000", joined.headers["set-cookie"].lower())
         self.assertEqual(self.client.post(f"/api/rooms/{room_id}/join", json={"nickname": "alice", "seat": 1}).status_code, 409)
         self.client.cookies.delete(cookie_name)  # a second browser joins Bob
         self.assertEqual(self.client.post(f"/api/rooms/{room_id}/join", json={"nickname": "Bob", "seat": 1}).status_code, 200)
@@ -124,6 +126,20 @@ class BrowserApiTests(unittest.TestCase):
         public = self.client.get(f"/api/rooms/{room_id}").json()
         self.assertEqual(public["players"][0]["nickname"], "Alice")
         self.assertNotIn("session_token_hash", json.dumps(public))
+
+    def test_existing_player_cookie_becomes_persistent_on_reentry(self):
+        room_id = self.create_room()
+        cookie_name = f"th_room_{room_id}"
+        joined = self.client.post(f"/api/rooms/{room_id}/join",
+                                  json={"nickname": "Alice", "seat": 0})
+        token = self.client.cookies.get(cookie_name)
+        self.client.cookies.delete(cookie_name)
+        self.client.cookies.set(cookie_name, token)  # An old session-only browser cookie.
+        state = self.client.get(f"/api/rooms/{room_id}/state")
+        self.assertEqual(state.status_code, 200)
+        self.assertEqual(state.json()["game"]["viewer_player_id"], joined.json()["player_id"])
+        self.assertIn("max-age=2592000", state.headers["set-cookie"].lower())
+        self.assertIn(f"{cookie_name}={token};", state.headers["set-cookie"])
 
     def test_spectator_can_sit_watch_and_leave_after_hand(self):
         room_id = self.create_room()
@@ -250,6 +266,7 @@ class BrowserApiTests(unittest.TestCase):
         self.assertEqual(recovered.status_code, 200, recovered.text)
         self.assertEqual(recovered.json()["player_id"], player_id)
         self.assertIn("httponly", recovered.headers["set-cookie"].lower())
+        self.assertIn("max-age=2592000", recovered.headers["set-cookie"].lower())
         new_cookie = self.client.cookies.get(cookie_name)
         self.assertNotEqual(old_cookie, new_cookie)
         self.assertEqual(self.client.get(f"/api/rooms/{room_id}/state").status_code, 200)

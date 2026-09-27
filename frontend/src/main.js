@@ -1,5 +1,6 @@
 const app = document.querySelector('#app');
 const roomId = location.pathname.startsWith('/r/') ? location.pathname.split('/')[2] : null;
+document.body.classList.toggle('room-view', Boolean(roomId));
 let socket = null;
 let roomData = null;
 let currentGame = null;
@@ -20,6 +21,9 @@ let audioContext = null;
 const activeAudio = new Set();
 let lastActionEvent = null;
 let lastTurnEvent = null;
+let lastVisualHandId;
+let lastVisualStreet;
+let visualTransitionUntil = 0;
 
 async function loadAudioManifest() {
   try { audioManifest = await api('/api/audio-manifest'); } catch { audioManifest = {}; }
@@ -32,15 +36,17 @@ function playAudio(category) {
     activeAudio.add(sound);
     sound.addEventListener('ended', () => activeAudio.delete(sound), { once: true });
     sound.play().catch(() => activeAudio.delete(sound));
-  } else if (category === 'turn') {
+  } else if (category === 'turn' || category === 'deal') {
     try {
       audioContext ||= new (window.AudioContext || window.webkitAudioContext)();
       const oscillator = audioContext.createOscillator(), gain = audioContext.createGain();
-      oscillator.type = 'sine'; oscillator.frequency.value = 880;
+      oscillator.type = category === 'deal' ? 'triangle' : 'sine';
+      oscillator.frequency.value = category === 'deal' ? 520 : 880;
       gain.gain.setValueAtTime(0.08, audioContext.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.001, audioContext.currentTime + 0.25);
+      gain.gain.exponentialRampToValueAtTime(0.001,
+        audioContext.currentTime + (category === 'deal' ? 0.12 : 0.25));
       oscillator.connect(gain).connect(audioContext.destination);
-      oscillator.start(); oscillator.stop(audioContext.currentTime + 0.25);
+      oscillator.start(); oscillator.stop(audioContext.currentTime + (category === 'deal' ? 0.12 : 0.25));
     } catch { /* Audio may be unavailable in this browser. */ }
   }
 }
@@ -54,7 +60,15 @@ function handleSounds(game, myId) {
   lastActionEvent = actionKey;
   const actor = game.players?.[game.to_act_index];
   const turnKey = actor ? `${game.hand_id}:${game.street}:${game.history?.length || 0}:${actor.player_id}` : null;
-  if (turnKey && actor.player_id === myId && lastTurnEvent !== turnKey && game.deadline_at) playAudio('turn');
+  if (turnKey && actor.player_id === myId && lastTurnEvent !== turnKey && game.deadline_at) {
+    const waitMs = Math.max(0, (game.deadline_at - (game.decision_total_seconds || 0) - Date.now() / 1000) * 1000);
+    if (waitMs > 0) setTimeout(() => {
+      const activeActor = currentGame?.players?.[currentGame.to_act_index];
+      if (currentGame?.hand_id === game.hand_id && activeActor?.player_id === myId &&
+          currentGame?.history?.length === game.history?.length && roomData?.play_state !== 'paused') playAudio('turn');
+    }, waitMs);
+    else playAudio('turn');
+  }
   lastTurnEvent = turnKey;
 }
 
@@ -393,13 +407,29 @@ function connectSocket() {
   };
 }
 
-function positionAtTable(element, position, count, dealer = false) {
+const TABLE_VERTICAL_RADII = {
+  compact: { 2: 29, 4: 29, 5: 33, 6: 29, 7: 33, 8: 29, 9: 31.5 },
+  portrait: { 5: 26, 8: 27, 9: 34 },
+  desktop: { 2: 32, 4: 32, 5: 40, 6: 32, 7: 34, 8: 32, 9: 34 },
+};
+
+function positionAtTable(element, position, count, viewerSeat = 0, dealer = false) {
   const portrait = window.matchMedia('(max-width: 900px)').matches;
-  const angle = Math.PI - 2 * Math.PI * position / count;
-  const radiusX = dealer ? (portrait ? 20 : 27) : (portrait ? 35 : 39);
-  const radiusY = dealer ? (portrait ? 27 : 24) : 37;
-  element.style.left = `${50 + radiusX * Math.sin(angle)}%`;
-  element.style.top = `${50 - radiusY * Math.cos(angle)}%`;
+  const compact = window.matchMedia('(max-width: 560px)').matches;
+  const relativePosition = (position - viewerSeat + count) % count;
+  const angle = Math.PI - 2 * Math.PI * relativePosition / count;
+  const radiusX = compact ? 40.25 : 39;
+  const radii = compact ? TABLE_VERTICAL_RADII.compact
+    : portrait ? TABLE_VERTICAL_RADII.portrait : TABLE_VERTICAL_RADII.desktop;
+  const radiusY = radii[count] ?? (portrait ? 22 : 24);
+  const upperDiagonal = count === 8 && (relativePosition === 3 || relativePosition === 5);
+  const seatX = 50 + radiusX * Math.sin(angle) +
+    (upperDiagonal ? Math.sign(Math.sin(angle)) * (compact ? 7 : 4) : 0);
+  const seatY = relativePosition === 0 ? (compact ? 67 : 65)
+    : (portrait ? 46 : 45) - radiusY * Math.cos(angle);
+  // Keep the button beside its owner's seat, outside the community-card lane.
+  element.style.left = `${seatX + (dealer ? (Math.sin(angle) >= 0 ? 1 : -1) * (compact ? 5.5 : 6) : 0)}%`;
+  element.style.top = `${seatY + (dealer ? Math.cos(angle) * (portrait ? 5.5 : 5) : 0)}%`;
 }
 
 function renderRoom(payload) {
@@ -422,9 +452,24 @@ function renderRoom(payload) {
   const me = game.players?.find(p => p.player_id === myId);
   const lockedInHand = Boolean(active && me);
   const current = game.players?.[game.to_act_index];
+  const viewerSeat = seated ? roomMe.seat : 0;
+  const newHand = lastVisualHandId !== undefined && Boolean(game.hand_id) && game.hand_id !== lastVisualHandId;
+  const newStreet = lastVisualHandId === game.hand_id && lastVisualStreet !== game.street &&
+    (['flop', 'turn', 'river'].includes(game.street) ||
+      (game.street === 'complete' && game.runout_boards?.length));
+  const settledHand = lastVisualHandId === game.hand_id && lastVisualStreet !== 'complete' &&
+    game.street === 'complete';
+  if (newHand || newStreet || settledHand) visualTransitionUntil = Date.now() + 1000;
+  const dealingTransition = Date.now() < visualTransitionUntil;
   const previousTableScroll = document.querySelector('.table-scroll')?.scrollLeft;
   const seatedCount = room.players.filter(p => p.seat !== null).length;
-  app.innerHTML = `<section class="hero compact room-heading"><div><div class="eyebrow">PRIVATE TABLE · ${room.room_id.slice(0, 8)}</div><h1>朋友牌局</h1><p>盲注 ${room.small_blind}/${room.big_blind} · 买入上限 ${money(room.max_buyin_stack)} · ${seatedCount}/${room.max_players} 人入座</p></div><div class="room-identity"><span id="identity-name"></span><span id="identity-seat"></span><button id="leave-room" class="btn secondary mini" type="button">退出牌桌</button></div></section><div class="room-layout"><aside class="panel profit-panel"><h2>玩家盈亏</h2><p class="muted small">已结算筹码 − 累计买入；离桌筹码计入兑出。</p><div id="profit-list"></div><div class="rule"></div><h3>旁观者</h3><div id="spectator-list"></div></aside><div class="table-column"><div class="table-scroll"><section class="table-wrap"><div class="table-felt"></div><div class="table-top"><span id="street"></span><span id="turn"></span></div><div class="table-center"><div id="board" class="board"></div><div class="pot">总底池<b id="pot">0</b></div></div><div id="seats" class="seats"></div></section></div><p class="scroll-hint">左右滑动牌桌可查看所有座位</p><section class="panel control-panel"><div class="control-header"><div><h2>我的位置与筹码</h2><p id="seat-help" class="muted small"></p></div><div class="stack-number"><span>当前筹码</span><strong id="my-stack"></strong></div></div><div id="seat-controls" class="row"></div><div id="buyin-area"></div><div class="rule"></div><h2>我的操作</h2><div id="action-area"></div></section><section class="panel action-panel"><h2>本手行动</h2><div id="action-history" class="history-list"></div></section></div><aside class="panel records-panel"><div class="row"><h2>我的手牌记录</h2><button id="history-refresh" class="btn secondary mini right" type="button">刷新</button></div><label class="field">查找手牌<input id="history-search" type="search" placeholder="输入手牌编号或牌面"></label><div id="history-content"><p class="muted small">正在载入你的记录…</p></div></aside></div>`;
+  app.innerHTML = `<section class="hero compact room-heading"><div><div class="eyebrow">PRIVATE TABLE · ${room.room_id.slice(0, 8)}</div><h1>朋友牌局</h1><p>盲注 ${room.small_blind}/${room.big_blind} · 买入上限 ${money(room.max_buyin_stack)} · ${seatedCount}/${room.max_players} 人入座</p></div><div class="room-identity"><span id="identity-name"></span><span id="identity-seat"></span><button id="leave-room" class="btn secondary mini" type="button">退出牌桌</button></div></section>
+    <div class="room-layout"><aside class="panel profit-panel"><h2>玩家盈亏</h2><p class="muted small">已结算筹码 − 累计买入；离桌筹码计入兑出。</p><div id="profit-list"></div><div class="rule"></div><h3>旁观者</h3><div id="spectator-list"></div></aside>
+    <div class="table-column"><div class="table-scroll"><section class="table-wrap"><div class="table-felt"></div><div class="table-top"><span id="street"></span><span id="turn"></span></div><div class="table-center"><div id="board" class="board"></div><div class="pot">总底池<b id="pot">0</b></div></div><div id="seats" class="seats"></div><div id="deal-transition" class="deal-transition" hidden>发牌中…</div><div id="action-area" class="table-actions"></div></section></div>
+    <section class="panel control-panel"><div class="control-header"><div><h2>我的位置与筹码</h2><p id="seat-help" class="muted small"></p></div><div class="stack-number"><span>当前筹码</span><strong id="my-stack"></strong></div></div><div id="seat-controls" class="row"></div><div id="buyin-area"></div></section><section class="panel action-panel"><h2>本手行动</h2><div id="action-history" class="history-list"></div></section></div>
+    <aside class="panel records-panel"><div class="row"><h2>我的手牌记录</h2><button id="history-refresh" class="btn secondary mini right" type="button">刷新</button></div><label class="field">查找手牌<input id="history-search" type="search" placeholder="输入手牌编号或牌面"></label><div id="history-content"><p class="muted small">正在载入你的记录…</p></div></aside></div>`;
+  document.querySelector('.table-wrap').classList.toggle('settled-hand',
+    game.street === 'complete' && dealingTransition);
   if (closed) document.querySelector('.room-heading').after(node('div',
     active ? '牌桌已关闭：当前手会结算完，之后不再开局。' : '牌桌已关闭：邀请已停用，历史记录仍可查看。', 'notice'));
   const tableScroll = document.querySelector('.table-scroll');
@@ -456,12 +501,22 @@ function renderRoom(payload) {
   document.querySelector('#turn').textContent = room.play_state === 'paused' ? '游戏已暂停' : current ? `轮到 ${current.name}` : game.street === 'runout_vote' ? '等待入池玩家投票' : active ? '牌局进行中' : '等待开局';
   document.querySelector('#pot').textContent = money(game.pot);
   const board = document.querySelector('#board');
-  for (let i = 0; i < 5; i++) board.append(card(game.community?.[i]));
+  document.querySelector('.table-center').classList.toggle('double-runout', (game.runout_boards?.length || 0) > 1);
+  if (game.runout_boards?.length > 1) board.append(node('span', '第一次', 'board-label'));
+  for (let i = 0; i < 5; i++) {
+    const playingCard = card(game.runout_boards?.[0]?.[i] || game.community?.[i]);
+    if (dealingTransition && !playingCard.classList.contains('empty')) playingCard.classList.add('dealt-card');
+    board.append(playingCard);
+  }
   if (game.runout_boards?.length > 1) {
     const second = node('div', '', 'second-board');
-    second.append(node('span', '第二次', 'small'));
-    for (const code of game.runout_boards[1]) second.append(card(code));
-    document.querySelector('.table-center').append(second);
+    second.append(node('span', '第二次', 'board-label'));
+    for (const code of game.runout_boards[1]) {
+      const playingCard = card(code);
+      if (dealingTransition) playingCard.classList.add('dealt-card');
+      second.append(playingCard);
+    }
+    document.querySelector('.table-center').insertBefore(second, document.querySelector('.pot'));
   }
   const publicClock = node('div', '', 'public-clock'); publicClock.id = 'public-clock';
   publicClock.append(node('div', '', 'public-clock-title'), node('div', '', 'public-clock-track'));
@@ -473,9 +528,11 @@ function renderRoom(payload) {
     const state = person && game.players?.find(p => p.player_id === person.player_id);
     const item = node('div', '', 'seat');
     item.dataset.position = String(position);
-    positionAtTable(item, position, room.max_players);
+    positionAtTable(item, position, room.max_players, viewerSeat);
     if (person?.player_id === myId) item.classList.add('me');
-    if (current && state?.player_id === current.player_id) item.classList.add('turn');
+    if ((current && state?.player_id === current.player_id) ||
+        (game.street === 'runout_vote' && state && !state.folded &&
+          !game.runout_votes?.[state.player_id])) item.classList.add('turn');
     item.append(node('div', `座位 ${position + 1}`, 'seat-head'));
     if (!person) {
       item.classList.add('empty-seat');
@@ -487,7 +544,8 @@ function renderRoom(payload) {
       item.append(plus, node('div', '点击入座', 'seat-name'));
     } else {
       item.append(node('div', person.nickname, 'seat-name'));
-      if (person.ready && person.seat !== null) item.append(node('span', '已准备', 'ready-badge'));
+      if (room.play_state === 'waiting' && !game.hand_id && person.ready && person.seat !== null)
+        item.append(node('span', '已准备', 'ready-badge'));
       if (room.play_state === 'waiting' && person.start_confirmed) item.append(node('span', '已确认开局', 'confirm-badge'));
       if (game.street === 'runout_vote' && game.runout_votes?.[person.player_id]) {
         item.append(node('span', `已选发${game.runout_votes[person.player_id] === 'twice' ? '两次' : '一次'}`, 'confirm-badge'));
@@ -507,7 +565,11 @@ function renderRoom(payload) {
     if (state && (active || game.street === 'complete')) {
       const cards = node('div', '', 'seat-cards');
       const codes = state.hole || ['back', 'back'];
-      codes.forEach(code => cards.append(card(code))); item.append(cards);
+      codes.forEach(code => {
+        const playingCard = card(code);
+        if (dealingTransition) playingCard.classList.add('dealt-card');
+        cards.append(playingCard);
+      }); item.append(cards);
     }
     seats.append(item);
     if (state && game.button_index !== undefined && state === game.players?.[game.button_index]) {
@@ -515,7 +577,7 @@ function renderRoom(payload) {
       dealer.dataset.position = String(position);
       dealer.title = '庄家按钮';
       dealer.setAttribute('aria-label', `座位 ${position + 1} 的庄家按钮`);
-      positionAtTable(dealer, position, room.max_players, true);
+      positionAtTable(dealer, position, room.max_players, viewerSeat, true);
       seats.append(dealer);
     }
   }
@@ -540,13 +602,15 @@ function renderRoom(payload) {
       catch (error) { notice(error.message); }
     });
     document.querySelector('#seat-controls').append(stand);
-    const ready = node('button', roomMe.ready ? '取消准备' : '准备进入牌局', roomMe.ready ? 'btn secondary mini' : 'btn mini ready-button');
-    ready.type = 'button'; ready.disabled = lockedInHand || (!roomMe.ready && roomMe.stack <= 0);
-    ready.addEventListener('click', async () => {
-      try { await api(`/api/rooms/${roomId}/ready`, { method: 'POST', body: JSON.stringify({ ready: !roomMe.ready }) }); await enterRoom(); }
-      catch (error) { notice(error.message); }
-    });
-    document.querySelector('#seat-controls').append(ready);
+    if (room.play_state === 'waiting') {
+      const ready = node('button', roomMe.ready ? '取消准备' : '准备进入牌局', roomMe.ready ? 'btn secondary mini' : 'btn mini ready-button');
+      ready.type = 'button'; ready.disabled = lockedInHand || (!roomMe.ready && roomMe.stack <= 0);
+      ready.addEventListener('click', async () => {
+        try { await api(`/api/rooms/${roomId}/ready`, { method: 'POST', body: JSON.stringify({ ready: !roomMe.ready }) }); await enterRoom(); }
+        catch (error) { notice(error.message); }
+      });
+      document.querySelector('#seat-controls').append(ready);
+    }
     const allSeated = room.players.filter(p => p.seat !== null);
     if (room.play_state === 'waiting' && allSeated.length >= 2 && allSeated.length < room.max_players &&
         allSeated.every(p => p.ready)) {
@@ -573,6 +637,9 @@ function renderRoom(payload) {
   search.value = historyQuery;
   search.addEventListener('input', () => { historyQuery = search.value; renderHistory(); });
   renderHistory();
+  if (newHand || newStreet) playAudio('deal');
+  lastVisualHandId = game.hand_id || null;
+  lastVisualStreet = game.street;
 }
 
 async function takeSeat(position) {
@@ -618,7 +685,22 @@ function renderActions(game, me) {
     '牌桌已关闭，可以查看自己曾参与的手牌记录。' : '正在旁观。这手牌结束后，如果你已入座并买入筹码，就能参加下一手。', 'muted'));
   if (!game.hand_id) return area.append(node('p', roomData.status !== 'open' ?
     '牌桌已关闭。' : roomData.play_state === 'running' ? '玩家已确认，即将发牌。' : '等待入座玩家准备并确认开局。', 'muted'));
-  if (game.street === 'complete') return area.append(node('p', roomData.status !== 'open' ? '本手已结算，牌桌已关闭。' : roomData.play_state === 'running' ? '本手已结算，即将自动开始下一手。' : '本手已结算，等待开局。', 'muted'));
+  if (game.street === 'complete') {
+    area.append(node('p', roomData.status !== 'open' ? '本手已结算，牌桌已关闭。' :
+      roomData.play_state === 'running' ? '本手已结算，即将开始下一手。' : '本手已结算，等待开局。', 'muted'));
+    if (game.runout_pots?.length) {
+      const results = node('div', '', 'runout-results');
+      for (const [index, pot] of game.runout_pots.entries()) {
+        const names = (pot.awards || []).map(award =>
+          `第${award.board}次 ${game.players?.[award.player_index]?.name || '?'} +${money(award.amount)}`).join(' · ');
+        results.append(node('div',
+          `${index ? `边池 ${index}` : '主池'} ${money(pot.amount)} · 发${pot.runs}次${names ? ` · ${names}` : ''}`,
+          'runout-result'));
+      }
+      area.append(results);
+    }
+    return;
+  }
   if (game.street === 'runout_vote') {
     area.append(node('p', '入池玩家选择发一次或发两次。每个底池由有资格争夺该池的玩家共同决定；超时视为选择一次。', 'muted small'));
     if (game.runout_can_vote && roomData.play_state !== 'paused') {
@@ -648,7 +730,7 @@ function renderActions(game, me) {
       }); await enterRoom();
     } catch (error) { await enterRoom(); notice(error.message); }
   });
-  area.append(extend);
+  document.querySelector('.table-wrap').append(extend);
   const controls = node('div', '', 'actions'); area.append(controls);
   function button(title, action, amount = 0, style = 'secondary') {
     const control = node('button', title, `btn ${style}`); control.type = 'button';
@@ -696,12 +778,17 @@ function updateTimer() {
     Math.max(0, (game.deadline_at || 0) - Date.now() / 1000);
   const total = game.decision_total_seconds ||
     roomData[game.street === 'runout_vote' ? 'runout_vote_seconds' : `${game.street}_seconds`] || 1;
-  const percent = Math.max(0, Math.min(100, Math.round(remaining / total * 100)));
+  const dealing = roomData.play_state !== 'paused' && remaining > total;
+  const visibleRemaining = Math.min(remaining, total);
+  const percent = Math.max(0, Math.min(100, Math.round(visibleRemaining / total * 100)));
   const title = clock.querySelector('.public-clock-title');
-  title.textContent = `${roomData.play_state === 'paused' ? '已暂停 · ' : ''}${game.street === 'runout_vote' ? '发牌投票' : '行动倒计时'} ${Math.ceil(remaining)} 秒 · ${percent}%`;
+  title.textContent = dealing ? '发牌中 · 即将行动' :
+    `${roomData.play_state === 'paused' ? '已暂停 · ' : ''}${game.street === 'runout_vote' ? '发牌投票' : '行动倒计时'} ${Math.ceil(visibleRemaining)} 秒 · ${percent}%`;
   const track = clock.querySelector('.public-clock-track');
   track.style.setProperty('--remaining', `${percent}%`);
   track.classList.toggle('urgent', remaining <= 5 && roomData.play_state !== 'paused');
+  document.querySelector('#deal-transition').hidden = !dealing;
+  document.querySelector('#action-area').classList.toggle('dealing', dealing);
   const extend = document.querySelector('#extend-decision');
   if (extend) extend.hidden = !(roomData.play_state !== 'paused' && game.legal_actions &&
     !game.extension_used && remaining > 0 && remaining <= 5);
@@ -780,8 +867,10 @@ else renderHome();
 
 window.addEventListener('resize', () => {
   if (!roomData) return;
+  const viewerId = currentGame?.viewer_player_id || currentGame?.player_id;
+  const viewerSeat = roomData.players.find(player => player.player_id === viewerId)?.seat ?? 0;
   document.querySelectorAll('.seat[data-position], .dealer-button[data-position]').forEach(element => {
-    positionAtTable(element, Number(element.dataset.position), roomData.max_players,
+    positionAtTable(element, Number(element.dataset.position), roomData.max_players, viewerSeat,
       element.classList.contains('dealer-button'));
   });
 });

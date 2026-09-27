@@ -232,8 +232,36 @@ class HoldemEngineTests(unittest.TestCase):
         self.assertEqual(restored.refunds, [0, 0, 0])
         self.assertEqual(len(restored.runout_boards), 2)
         self.assertEqual(len(set(restored.runout_boards[0] + restored.runout_boards[1])), 10)
+        visible = restored.state_for_player(restored.players[0].player_id)
+        self.assertEqual(visible["community"], visible["runout_boards"][0])
+        self.assertEqual([pot["runs"] for pot in visible["runout_pots"]], [1, 2])
+        self.assertEqual(sum(award["amount"] for pot in visible["runout_pots"]
+                             for award in pot["awards"]), 25)
+        self.assertEqual({award["board"] for award in visible["runout_pots"][0]["awards"]}, {1})
+        self.assertEqual({award["board"] for award in visible["runout_pots"][1]["awards"]}, {1, 2})
+        self.assertNotIn("deck", json.dumps(visible))
         with self.assertRaises(InvalidAction):
             restored.resolve_runout()
+
+    def test_twice_after_flop_shares_flop_and_uses_two_turn_river_pairs(self):
+        game = make_game([6, 6])
+        act(game, Action(ActionType.CALL))
+        act(game, Action(ActionType.CHECK))
+        self.assertEqual(game.street, "flop")
+        original_flop = [card.code() for card in game.table.community]
+        act(game, Action(ActionType.BET, 4))
+        act(game, Action(ActionType.CALL))
+        self.assertEqual(game.street, "runout_vote")
+        for player in game.players:
+            game.submit_runout_vote(player.player_id, "twice", game.version)
+        self.assertEqual(game.street, "complete")
+        first, second = [[card.code() for card in run] for run in game.runout_boards]
+        self.assertEqual(first[:3], original_flop)
+        self.assertEqual(second[:3], original_flop)
+        self.assertEqual(len(set(first[3:] + second[3:])), 4)
+        self.assertEqual([pot["runs"] for pot in game.runout_pots], [2])
+        self.assertEqual(sum(game.payouts), 12)
+        self.assertEqual(sum(player.stack for player in game.players), 12)
 
     def test_clock_extension_once_and_pause_remaining(self):
         game = make_game([100, 100])

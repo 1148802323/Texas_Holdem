@@ -6,11 +6,11 @@
 
 ## 当前状态
 
-已具备逐次操作的规则引擎、SQLite 持久化、管理员建房、邀请入座、浏览器牌桌和 WebSocket 同步。当前可在本机运行；公网部署与部分管理功能仍待完成。
+已具备逐次操作的规则引擎、SQLite 持久化、管理员建房、邀请入座、浏览器牌桌和 WebSocket 同步。单机公网版已部署；服务器配置、首次安装、备份和故障排查见 [部署指南](docs/deployment.md)。
 
 **运行网页牌桌：**按 [网页运行说明](docs/web.md) 设置管理员密码并启动服务，访问 `http://127.0.0.1:8000/admin`。
 
-域名和服务器准备好之前，可先按 [部署与备份准备](docs/deployment.md) 检查单进程部署模板、在线备份和恢复演练。
+需要重新部署或维护线上服务时，按 [部署指南](docs/deployment.md) 操作；真实密码和数据库文件不在仓库中。
 
 ## 目录职责
 
@@ -100,4 +100,4 @@ D:\miniconda\envs\Texas_Holdem\python.exe -B -X utf8 -m backend.examples.init_da
 
 ## 下一步
 
-完成部署演练后，再配置域名、服务器及公网联机验收。详细顺序见 [开发计划](docs/development-plan.md)，已确认范围见 [需求说明](docs/requirements.md)。
+后续功能顺序见 [开发计划](docs/development-plan.md)，已确认范围见 [需求说明](docs/requirements.md)。

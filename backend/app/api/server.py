@@ -25,6 +25,14 @@ from ..services.storage import AccessDenied, Conflict, PokerStore, StoreError
 ROOT = Path(__file__).resolve().parents[3]
 FRONTEND = ROOT / "frontend"
 logger = logging.getLogger(__name__)
+PLAYER_COOKIE_MAX_AGE = 30 * 24 * 60 * 60
+
+
+def set_player_cookie(response: Response, request: Request, room_id: str, token: str) -> None:
+    """Keep a player's room identity across ordinary browser restarts."""
+    response.set_cookie(f"th_room_{room_id}", token,
+                        max_age=PLAYER_COOKIE_MAX_AGE, httponly=True,
+                        secure=request.url.scheme == "https", samesite="lax", path="/")
 
 
 class LoginBody(BaseModel):
@@ -310,9 +318,7 @@ def create_app(db_path: str | Path | None = None, admin_password: str | None = N
             else:
                 raise Conflict("This browser has already joined this room")
         access = await asyncio.to_thread(store.join_player, room_id, body.nickname, body.seat)
-        response.set_cookie(f"th_room_{room_id}", access.session_token,
-                            httponly=True, secure=request.url.scheme == "https",
-                            samesite="lax", path="/")
+        set_player_cookie(response, request, room_id, access.session_token)
         await hub.broadcast(room_id)
         return {"player_id": access.player_id, "nickname": access.nickname, "seat": access.seat}
 
@@ -330,9 +336,7 @@ def create_app(db_path: str | Path | None = None, admin_password: str | None = N
             recent.append(now)
             raise
         recovery_failures.pop(address, None)
-        response.set_cookie(f"th_room_{room_id}", access.session_token,
-                            httponly=True, secure=request.url.scheme == "https",
-                            samesite="lax", path="/")
+        set_player_cookie(response, request, room_id, access.session_token)
         await hub.broadcast(room_id)
         return {"player_id": access.player_id, "nickname": access.nickname, "seat": access.seat}
 
@@ -359,12 +363,13 @@ def create_app(db_path: str | Path | None = None, admin_password: str | None = N
         return result
 
     @app.get("/api/rooms/{room_id}/state")
-    async def state(room_id: str, request: Request):
+    async def state(room_id: str, request: Request, response: Response):
         token = player_token(request, room_id)
         room, game = await asyncio.gather(
             asyncio.to_thread(store.public_room, room_id, True),
             asyncio.to_thread(store.player_view, room_id, token),
         )
+        set_player_cookie(response, request, room_id, token)
         return {"room": room, "game": game}
 
     @app.post("/api/rooms/{room_id}/buyins")
@@ -416,11 +421,11 @@ def create_app(db_path: str | Path | None = None, admin_password: str | None = N
     @app.get("/api/audio-manifest")
     async def audio_manifest():
         directory = FRONTEND / "src" / "audio"
-        pattern = re.compile(r"^(check|bet|raise|call|fold|allin|turn)(?:[1-9]\d*|\([1-9]\d*\))?\.(mp3|wav|ogg|m4a)$", re.I)
+        pattern = re.compile(r"^(check|bet|raise|call|fold|allin|turn|deal)(?:[1-9]\d*|\([1-9]\d*\))?\.(mp3|wav|ogg|m4a)$", re.I)
         return {category: [f"/assets/audio/{path.name}" for path in sorted(directory.iterdir())
                            if path.is_file() and pattern.fullmatch(path.name) and
                            path.name.lower().startswith(category)]
-                for category in ("check", "bet", "raise", "call", "fold", "allin", "turn")}
+                for category in ("check", "bet", "raise", "call", "fold", "allin", "turn", "deal")}
 
     @app.get("/api/rooms/{room_id}/history")
     async def history(room_id: str, request: Request):

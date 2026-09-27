@@ -63,6 +63,7 @@ def _request_id(value: str) -> str:
 
 class PokerStore:
     INTER_HAND_SECONDS = 4
+    DEAL_TRANSITION_SECONDS = 1
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -655,7 +656,8 @@ class PokerStore:
             game.start_new_hand()
             if game.street != "complete" and (deadline_seconds is not None or ready_only):
                 game.start_clock(deadline_seconds if deadline_seconds is not None else
-                                 self._decision_seconds(room, game), time.time())
+                                 self._decision_seconds(room, game),
+                                 time.time() + self.DEAL_TRANSITION_SECONDS)
             button_seat = rows[game.button_index]["seat"]
             small_blind_index, big_blind_index = game._blinds()
             conn.execute(
@@ -757,8 +759,10 @@ class PokerStore:
         if game.street != "complete" and (deadline_seconds is not None or
                                           room["play_state"] == "running" or
                                           room["status"] == "closed"):
+            dealing_next_street = game.history[-1].street != game.street
             game.start_clock(deadline_seconds if deadline_seconds is not None else
-                             self._decision_seconds(room, game), time.time())
+                             self._decision_seconds(room, game),
+                             time.time() + (self.DEAL_TRANSITION_SECONDS if dealing_next_street else 0))
         record = game.history[-1]
         conn.execute(
             "INSERT INTO hand_actions(id, hand_id, player_id, request_id, sequence, "

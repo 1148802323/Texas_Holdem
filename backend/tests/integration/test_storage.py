@@ -352,6 +352,24 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(self.store.advance_rooms(time.time() + 10), [room_id])
         self.assertEqual(self.store.load_game(room_id).hand_number, 2)
 
+    def test_dealing_transition_preserves_full_decision_time(self):
+        room_id, alice, bob = self.room(first=100, second=100)
+        hand = self.store.start_hand(room_id, "deal-grace", deadline_seconds=60)
+        game = self.store.load_game(room_id)
+        self.assertAlmostEqual(game.deadline_at - time.time(), 61, delta=1)
+        self.assertEqual(game.decision_total_seconds, 60)
+        self.store.apply_action(room_id, hand["hand_id"], alice.session_token,
+                                Action(ActionType.CALL), game.version, "call", deadline_seconds=60)
+        game = self.store.load_game(room_id)
+        self.assertEqual(game.street, "preflop")
+        self.assertAlmostEqual(game.deadline_at - time.time(), 60, delta=1)
+        self.store.apply_action(room_id, hand["hand_id"], bob.session_token,
+                                Action(ActionType.CHECK), game.version, "check", deadline_seconds=60)
+        game = self.store.load_game(room_id)
+        self.assertEqual(game.street, "flop")
+        self.assertAlmostEqual(game.deadline_at - time.time(), 61, delta=1)
+        self.assertEqual(game.decision_total_seconds, 60)
+
     def test_runout_vote_timeout_survives_restart(self):
         room_id = self.store.create_room(1, 2, 2, 10, runout_vote_seconds=60)
         alice = self.store.join_player(room_id, "Alice", 0)

@@ -113,3 +113,111 @@
 .pending-seat-badge{position:absolute;left:-5px;bottom:-8px;border-radius:999px;padding:2px 5px;background:#e8ab82;color:#342114;font-size:9px;font-weight:900;white-space:nowrap}
 @media(max-width:900px){.admin-player-row{align-items:start;flex-direction:column}.pending-seat-badge{font-size:7px;padding:1px 3px}}
 @media(max-width:900px){.public-clock{width:125px;font-size:8px;padding:3px 5px}.public-clock-track{height:4px;margin-top:2px}.ready-badge,.confirm-badge{font-size:7px;padding:1px 3px}.second-board .playing-card{width:16px;height:22px;font-size:7px}.second-board span{font-size:8px}}
+
+/* In-hand controls stay on the felt; a seated player always sees their own seat below the board. */
+.room-view main{padding-top:14px}
+.room-view .room-heading{margin-bottom:12px}
+.table-wrap{height:540px}
+.table-center{top:45%;width:76%;gap:6px}
+.board,.second-board{display:flex;justify-content:center;align-items:center;gap:5px;min-height:0}
+.board-label{flex:none;color:#fff4dc;font-size:10px;font-weight:900;letter-spacing:.04em}
+.second-board .playing-card{width:46px;height:64px;font-size:17px}
+.seat{min-height:104px;padding:6px}
+.seat-head{font-size:10px;line-height:1}
+.seat-name{font-size:13px;line-height:1.1}
+.seat-chips{font-size:10px;line-height:1.1}
+.seat-cards{gap:4px}
+.seat-cards .playing-card{width:34px;height:46px;font-size:15px;border-radius:5px}
+.seat-cards .playing-card.back{font-size:14px}
+.seat.turn,.seat.me.turn{border:2px solid #ffe9a8;box-shadow:0 0 0 4px #f9d47c7d,0 0 22px #ffd879aa,0 7px 14px #0007;animation:seat-turn-glow 1.35s ease-in-out infinite alternate}
+.seat.turn::before{content:"行动中";position:absolute;top:-14px;left:0;padding:2px 5px;border-radius:5px;background:#ffe6a6;color:#292617;font-size:9px;font-weight:900;white-space:nowrap}
+@keyframes seat-turn-glow{to{box-shadow:0 0 0 6px #f9d47c4d,0 0 33px #ffd879db,0 7px 14px #0007}}
+.table-actions{position:absolute;z-index:6;bottom:9px;left:50%;transform:translateX(-50%);width:calc(100% - 26px);max-width:610px;padding:8px 10px;border:1px solid #eed1938c;border-radius:13px;background:#071e1be8;box-shadow:0 8px 24px #0008;min-height:40px;text-align:center}
+.table-actions:empty{display:none}
+.table-actions p{margin:0;color:#e9ead9;font-size:11px;line-height:1.25}
+.table-actions .actions{display:flex;justify-content:center;align-items:end;gap:6px;margin:0;flex-wrap:wrap}
+.table-actions .actions .btn{min-height:38px;padding:6px 10px;font-size:12px}
+.table-actions .actions .field{min-width:90px;max-width:120px;margin:0;text-align:left;font-size:10px}
+.table-actions .field input{padding:6px 8px;min-height:38px}
+.table-wrap>.extend-button{position:absolute;z-index:8;top:38px;left:50%;transform:translateX(-50%);width:min(260px,70%);margin:0;min-height:35px}
+.table-actions.dealing{pointer-events:none;opacity:.45}
+.deal-transition{position:absolute;z-index:7;top:45%;left:50%;transform:translate(-50%,-50%);padding:6px 13px;border:1px solid #f6dca5;border-radius:999px;background:#142d27ed;color:#fff2d8;font-size:12px;font-weight:900;white-space:nowrap;pointer-events:none}
+.deal-transition[hidden]{display:none}
+.runout-results{display:grid;gap:3px;max-height:78px;overflow-y:auto;text-align:left}
+.runout-result{color:#ffecc4;font-size:11px;line-height:1.25}
+.dealt-card{animation:deal-card .75s cubic-bezier(.2,.7,.2,1) both}
+@keyframes deal-card{from{opacity:.15;transform:translateY(-16px) rotate(-6deg)}to{opacity:1;transform:none}}
+.table-wrap.settled-hand::after{content:"本手结算";position:absolute;z-index:7;top:34%;left:50%;transform:translateX(-50%);padding:6px 16px;border:1px solid #ffe3a2;border-radius:999px;background:#0c3027ef;color:#ffe9b2;font-size:13px;font-weight:900;white-space:nowrap;pointer-events:none;animation:settlement-badge 1s ease-out both}
+.table-wrap.settled-hand .pot{animation:settlement-pot 1s ease-out}
+@keyframes settlement-badge{0%{opacity:0;transform:translate(-50%,12px) scale(.85)}25%,75%{opacity:1;transform:translate(-50%,0) scale(1)}100%{opacity:0;transform:translate(-50%,-8px) scale(1.04)}}
+@keyframes settlement-pot{40%{box-shadow:0 0 0 8px #f5d89450,0 0 28px #f5d894aa}}
+
+@media(max-width:900px){
+  .room-view .topbar{height:42px}
+  .room-view .topbar nav{display:none}
+  .room-view .brand{font-size:11px;gap:5px}
+  .room-view .brand-mark{width:25px;height:25px;font-size:15px}
+  .room-view footer{display:none}
+  .room-view main{padding:6px 0 18px}
+  .room-heading{display:flex;align-items:center;gap:6px;margin-bottom:6px}
+  .room-heading h1{display:none}
+  .room-heading .eyebrow{font-size:9px;letter-spacing:.07em}
+  .room-heading p{font-size:10px;line-height:1.2;margin:2px 0 0}
+  .room-identity{justify-content:flex-end;gap:3px;font-size:10px}
+  .room-identity span{padding:3px 5px}
+  .room-identity .btn{min-height:26px;padding:3px 5px;font-size:10px}
+  .table-wrap{height:min(570px,calc(100svh - 145px));min-height:360px;max-width:460px}
+  .table-felt{inset:4% 4%;border-width:8px}
+  .table-top{top:7px;left:9px;right:9px;font-size:9px}
+  .table-center{top:46%;width:72%;gap:4px}
+  .board,.second-board{gap:2px}
+  .board .playing-card,.second-board .playing-card{width:26px;height:37px;border-radius:4px;font-size:12px}
+  .board-label{font-size:8px}
+  .pot{min-width:98px;padding:2px 8px;font-size:8px}
+  .pot b{font-size:13px}
+  .seat{width:22%;min-height:67px;padding:3px;gap:1px}
+  .seat-head{font-size:8px}
+  .seat-name{font-size:10px}
+  .seat-chips{font-size:8px}
+  .seat-cards{gap:2px}
+  .seat-cards .playing-card{width:28px;height:39px;border-radius:3px;font-size:12px}
+  .seat-cards .playing-card.back{font-size:10px}
+  .seat.me{width:26%;min-height:76px}
+  .seat.me .playing-card{width:32px;height:43px;font-size:15px}
+  .table-actions{bottom:5px;width:calc(100% - 12px);max-width:410px;padding:4px 6px;border-radius:9px}
+  .table-actions .actions{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:3px}
+  .table-actions .actions .btn{min-width:0;min-height:35px;padding:4px 2px;font-size:10px;line-height:1.05}
+  .table-actions .actions .field{min-width:0;max-width:none;gap:0;font-size:0;line-height:0}
+  .table-actions .field input{min-height:35px;padding:3px 4px;font-size:12px;line-height:normal}
+  .table-wrap>.extend-button{top:31px;min-height:32px;font-size:11px}
+  .table-actions p,.runout-result{font-size:10px}
+  .deal-transition{top:46%;font-size:10px}
+  .public-clock{width:155px;font-size:9px;padding:3px 6px}
+  .second-board span{font-size:8px}
+  .control-panel{padding:12px}
+  .control-header h2{font-size:16px}
+  .control-header p{font-size:11px}
+  .stack-number strong{font-size:20px}
+}
+@media(max-width:560px){
+  .room-view .shell{padding:0 8px}
+  .room-identity #identity-seat{display:none}
+  .room-heading .eyebrow{display:none}
+  .room-heading p{font-size:9px}
+  .table-wrap{height:min(560px,calc(100svh - 130px));min-height:438px}
+  .table-felt{inset:3% 3%;border-width:6px}
+  .table-center{width:75%}
+  .seat{width:20.5%;min-height:64px}
+  .seat-cards .playing-card{width:25px;height:35px;font-size:11px}
+  .seat.me{width:28%;min-height:80px}
+  .seat.me .playing-card{width:31px;height:42px;font-size:14px}
+  .seat-plus{width:25px;height:25px;font-size:18px}
+  .seat.turn::before{font-size:7px;top:-11px;padding:1px 3px}
+  .seat.me.turn::before{top:2px;left:3px}
+}
+@media(max-width:360px){
+  .table-center.double-runout{top:43%}
+  .table-center.double-runout .board .playing-card,
+  .table-center.double-runout .second-board .playing-card{width:22px;height:34px;font-size:10px}
+}
+@media(prefers-reduced-motion:reduce){.seat.turn,.seat.me.turn,.dealt-card,.table-wrap.settled-hand::after,.table-wrap.settled-hand .pot{animation:none}.public-clock-track::before{transition:none}}
