@@ -24,6 +24,7 @@ let lastTurnEvent = null;
 let lastVisualHandId;
 let lastVisualStreet;
 let visualTransitionUntil = 0;
+let openSidebar = null;
 
 async function loadAudioManifest() {
   try { audioManifest = await api('/api/audio-manifest'); } catch { audioManifest = {}; }
@@ -413,7 +414,7 @@ const TABLE_VERTICAL_RADII = {
   desktop: { 2: 32, 4: 32, 5: 40, 6: 32, 7: 34, 8: 32, 9: 34 },
 };
 
-function positionAtTable(element, position, count, viewerSeat = 0, dealer = false) {
+function positionAtTable(element, position, count, viewerSeat = 0) {
   const portrait = window.matchMedia('(max-width: 900px)').matches;
   const compact = window.matchMedia('(max-width: 560px)').matches;
   const relativePosition = (position - viewerSeat + count) % count;
@@ -423,14 +424,45 @@ function positionAtTable(element, position, count, viewerSeat = 0, dealer = fals
     : portrait ? TABLE_VERTICAL_RADII.portrait : TABLE_VERTICAL_RADII.desktop;
   const radiusY = radii[count] ?? (portrait ? 22 : 24);
   const upperDiagonal = count === 8 && (relativePosition === 3 || relativePosition === 5);
-  const seatX = 50 + radiusX * Math.sin(angle) +
+  let seatX = 50 + radiusX * Math.sin(angle) +
     (upperDiagonal ? Math.sign(Math.sin(angle)) * (compact ? 7 : 4) : 0);
-  const seatY = relativePosition === 0 ? (compact ? 67 : 65)
+  if (!portrait && count === 9 && (relativePosition === 1 || relativePosition === 8))
+    seatX -= Math.sign(Math.sin(angle)) * 5.5;
+  let seatY = relativePosition === 0 ? (compact ? 67 : 65)
     : (portrait ? 46 : 45) - radiusY * Math.cos(angle);
+  if (!portrait && count >= 8 && (relativePosition === 1 || relativePosition === count - 1))
+    seatY -= count === 9 ? 3.2 : 2;
   // Keep the button beside its owner's seat, outside the community-card lane.
-  element.style.left = `${seatX + (dealer ? (Math.sin(angle) >= 0 ? 1 : -1) * (compact ? 5.5 : 6) : 0)}%`;
-  element.style.top = `${seatY + (dealer ? Math.cos(angle) * (portrait ? 5.5 : 5) : 0)}%`;
+  element.style.left = `${seatX}%`;
+  element.style.top = `${seatY}%`;
 }
+
+function markerSide(position, count, viewerSeat) {
+  const angle = Math.PI - 2 * Math.PI * ((position - viewerSeat + count) % count) / count;
+  if (Math.abs(Math.sin(angle)) > .78) {
+    const side = Math.sin(angle) > 0 ? 'left' : 'right';
+    return window.matchMedia('(max-width: 360px)').matches && (count === 3 || count === 7)
+      ? `${side}-high` : side;
+  }
+  return Math.cos(angle) > 0 ? 'bottom' : 'top';
+}
+
+function setSidebar(name) {
+  openSidebar = name;
+  for (const [side, panel, toggle] of [
+    ['profit', '.profit-panel', '#profit-toggle'],
+    ['records', '.records-panel', '#records-toggle'],
+  ]) {
+    document.querySelector(panel)?.classList.toggle('is-open', name === side);
+    document.querySelector(toggle)?.setAttribute('aria-expanded', String(name === side));
+  }
+  const backdrop = document.querySelector('#sidebar-backdrop');
+  if (backdrop) backdrop.hidden = !name;
+}
+
+window.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && openSidebar) setSidebar(null);
+});
 
 function renderRoom(payload) {
   roomData = payload.room;
@@ -459,17 +491,24 @@ function renderRoom(payload) {
       (game.street === 'complete' && game.runout_boards?.length));
   const settledHand = lastVisualHandId === game.hand_id && lastVisualStreet !== 'complete' &&
     game.street === 'complete';
-  if (newHand || newStreet || settledHand) visualTransitionUntil = Date.now() + 1000;
-  const dealingTransition = Date.now() < visualTransitionUntil;
+  if (settledHand) visualTransitionUntil = Date.now() + 1000;
+  const settlingTransition = game.street === 'complete' && Date.now() < visualTransitionUntil;
   const previousTableScroll = document.querySelector('.table-scroll')?.scrollLeft;
   const seatedCount = room.players.filter(p => p.seat !== null).length;
   app.innerHTML = `<section class="hero compact room-heading"><div><div class="eyebrow">PRIVATE TABLE · ${room.room_id.slice(0, 8)}</div><h1>朋友牌局</h1><p>盲注 ${room.small_blind}/${room.big_blind} · 买入上限 ${money(room.max_buyin_stack)} · ${seatedCount}/${room.max_players} 人入座</p></div><div class="room-identity"><span id="identity-name"></span><span id="identity-seat"></span><button id="leave-room" class="btn secondary mini" type="button">退出牌桌</button></div></section>
-    <div class="room-layout"><aside class="panel profit-panel"><h2>玩家盈亏</h2><p class="muted small">已结算筹码 − 累计买入；离桌筹码计入兑出。</p><div id="profit-list"></div><div class="rule"></div><h3>旁观者</h3><div id="spectator-list"></div></aside>
+    <div class="sidebar-launchers"><button id="profit-toggle" class="btn secondary mini" type="button" aria-controls="profit-panel" aria-expanded="false">◀ 玩家盈亏</button><button id="records-toggle" class="btn secondary mini" type="button" aria-controls="records-panel" aria-expanded="false">我的手牌记录 ▶</button></div>
+    <div id="sidebar-backdrop" class="sidebar-backdrop" hidden></div>
+    <div class="room-layout"><aside id="profit-panel" class="panel profit-panel" aria-label="玩家盈亏"><div class="sidebar-heading"><h2>玩家盈亏</h2><button class="sidebar-close btn secondary mini" type="button" aria-label="关闭玩家盈亏侧栏">关闭</button></div><p class="muted small">已结算筹码 − 累计买入；离桌筹码计入兑出。</p><div id="profit-list"></div><div class="rule"></div><h3>旁观者</h3><div id="spectator-list"></div></aside>
     <div class="table-column"><div class="table-scroll"><section class="table-wrap"><div class="table-felt"></div><div class="table-top"><span id="street"></span><span id="turn"></span></div><div class="table-center"><div id="board" class="board"></div><div class="pot">总底池<b id="pot">0</b></div></div><div id="seats" class="seats"></div><div id="deal-transition" class="deal-transition" hidden>发牌中…</div><div id="action-area" class="table-actions"></div></section></div>
     <section class="panel control-panel"><div class="control-header"><div><h2>我的位置与筹码</h2><p id="seat-help" class="muted small"></p></div><div class="stack-number"><span>当前筹码</span><strong id="my-stack"></strong></div></div><div id="seat-controls" class="row"></div><div id="buyin-area"></div></section><section class="panel action-panel"><h2>本手行动</h2><div id="action-history" class="history-list"></div></section></div>
-    <aside class="panel records-panel"><div class="row"><h2>我的手牌记录</h2><button id="history-refresh" class="btn secondary mini right" type="button">刷新</button></div><label class="field">查找手牌<input id="history-search" type="search" placeholder="输入手牌编号或牌面"></label><div id="history-content"><p class="muted small">正在载入你的记录…</p></div></aside></div>`;
-  document.querySelector('.table-wrap').classList.toggle('settled-hand',
-    game.street === 'complete' && dealingTransition);
+    <aside id="records-panel" class="panel records-panel" aria-label="我的手牌记录"><div class="sidebar-heading"><h2>我的手牌记录</h2><button class="sidebar-close btn secondary mini" type="button" aria-label="关闭手牌记录侧栏">关闭</button></div><button id="history-refresh" class="btn secondary mini" type="button">刷新</button><label class="field">查找手牌<input id="history-search" type="search" placeholder="输入手牌编号或牌面"></label><div id="history-content"><p class="muted small">正在载入你的记录…</p></div></aside></div>`;
+  setSidebar(openSidebar);
+  document.querySelector('#profit-toggle').addEventListener('click', () => setSidebar(openSidebar === 'profit' ? null : 'profit'));
+  document.querySelector('#records-toggle').addEventListener('click', () => setSidebar(openSidebar === 'records' ? null : 'records'));
+  document.querySelector('#sidebar-backdrop').addEventListener('click', () => setSidebar(null));
+  document.querySelectorAll('.sidebar-close').forEach(button =>
+    button.addEventListener('click', () => setSidebar(null)));
+  document.querySelector('.table-wrap').classList.toggle('settled-hand', settlingTransition);
   if (closed) document.querySelector('.room-heading').after(node('div',
     active ? '牌桌已关闭：当前手会结算完，之后不再开局。' : '牌桌已关闭：邀请已停用，历史记录仍可查看。', 'notice'));
   const tableScroll = document.querySelector('.table-scroll');
@@ -505,29 +544,24 @@ function renderRoom(payload) {
   if (game.runout_boards?.length > 1) board.append(node('span', '第一次', 'board-label'));
   for (let i = 0; i < 5; i++) {
     const playingCard = card(game.runout_boards?.[0]?.[i] || game.community?.[i]);
-    if (dealingTransition && !playingCard.classList.contains('empty')) playingCard.classList.add('dealt-card');
     board.append(playingCard);
   }
   if (game.runout_boards?.length > 1) {
     const second = node('div', '', 'second-board');
     second.append(node('span', '第二次', 'board-label'));
-    for (const code of game.runout_boards[1]) {
-      const playingCard = card(code);
-      if (dealingTransition) playingCard.classList.add('dealt-card');
-      second.append(playingCard);
-    }
+    for (const code of game.runout_boards[1]) second.append(card(code));
     document.querySelector('.table-center').insertBefore(second, document.querySelector('.pot'));
   }
   const publicClock = node('div', '', 'public-clock'); publicClock.id = 'public-clock';
   publicClock.append(node('div', '', 'public-clock-title'), node('div', '', 'public-clock-track'));
-  document.querySelector('.table-center').append(publicClock);
-  updateTimer();
+  document.querySelector('#action-area').append(publicClock);
   const seats = document.querySelector('#seats');
   for (let position = 0; position < room.max_players; position++) {
     const person = room.players.find(p => p.seat === position);
     const state = person && game.players?.find(p => p.player_id === person.player_id);
     const item = node('div', '', 'seat');
     item.dataset.position = String(position);
+    item.dataset.front = markerSide(position, room.max_players, viewerSeat);
     positionAtTable(item, position, room.max_players, viewerSeat);
     if (person?.player_id === myId) item.classList.add('me');
     if ((current && state?.player_id === current.player_id) ||
@@ -555,31 +589,41 @@ function renderRoom(payload) {
     }
     if (person) {
       const stack = money(active ? state?.stack ?? person.stack : person.stack);
-      const wager = state?.bet_this_street ? money(state.bet_this_street) : '';
       const status = state?.folded ? '弃牌' : state?.all_in ? '全下' : '';
       const chips = node('div', '', 'seat-chips');
-      chips.append(node('span', `${stack} 筹码${wager ? ` · 本轮 ${wager}` : ''}${status ? ` · ${status}` : ''}`, 'chips-long'));
-      chips.append(node('span', `${stack}${wager ? ` / 投${wager}` : ''}${status ? ` · ${status}` : ''}`, 'chips-compact'));
+      chips.append(node('span', `${stack} 筹码${status ? ` · ${status}` : ''}`, 'chips-long'));
+      chips.append(node('span', `${stack}${status ? ` · ${status}` : ''}`, 'chips-compact'));
       item.append(chips);
     }
     if (state && (active || game.street === 'complete')) {
       const cards = node('div', '', 'seat-cards');
       const codes = state.hole || ['back', 'back'];
-      codes.forEach(code => {
-        const playingCard = card(code);
-        if (dealingTransition) playingCard.classList.add('dealt-card');
-        cards.append(playingCard);
-      }); item.append(cards);
+      codes.forEach(code => cards.append(card(code)));
+      item.append(cards);
+    }
+    const dealerSeat = state && game.button_index !== undefined &&
+      state === game.players?.[game.button_index];
+    const wager = state?.bet_this_street || 0;
+    if (dealerSeat || wager > 0) {
+      const markers = node('div', '', 'seat-markers');
+      if (dealerSeat) {
+        const dealer = node('div', 'D', 'dealer-button');
+        dealer.title = '庄家按钮';
+        dealer.setAttribute('aria-label', `座位 ${position + 1} 的庄家按钮`);
+        markers.append(dealer);
+      }
+      if (wager > 0) {
+        const wagerChip = node('div', '', 'seat-wager');
+        wagerChip.setAttribute('aria-label', `本轮投入 ${money(wager)} 筹码`);
+        wagerChip.title = `本轮投入 ${money(wager)} 筹码`;
+        const icon = node('span', '', 'chip-icon');
+        icon.setAttribute('aria-hidden', 'true');
+        wagerChip.append(icon, node('span', money(wager)));
+        markers.append(wagerChip);
+      }
+      item.append(markers);
     }
     seats.append(item);
-    if (state && game.button_index !== undefined && state === game.players?.[game.button_index]) {
-      const dealer = node('div', 'D', 'dealer-button');
-      dealer.dataset.position = String(position);
-      dealer.title = '庄家按钮';
-      dealer.setAttribute('aria-label', `座位 ${position + 1} 的庄家按钮`);
-      positionAtTable(dealer, position, room.max_players, viewerSeat, true);
-      seats.append(dealer);
-    }
   }
   const profitList = document.querySelector('#profit-list');
   for (const player of room.leaderboard || []) {
@@ -625,6 +669,7 @@ function renderRoom(payload) {
   }
   renderBuyin(room, game, roomMe);
   renderActions(game, me);
+  updateTimer();
   const history = document.querySelector('#action-history');
   if (!game.history?.length) history.append(node('p', '暂无行动。', 'muted small'));
   for (const record of [...(game.history || [])].reverse()) {
@@ -867,10 +912,12 @@ else renderHome();
 
 window.addEventListener('resize', () => {
   if (!roomData) return;
+  if (window.innerWidth > 1250 && openSidebar) setSidebar(null);
   const viewerId = currentGame?.viewer_player_id || currentGame?.player_id;
   const viewerSeat = roomData.players.find(player => player.player_id === viewerId)?.seat ?? 0;
-  document.querySelectorAll('.seat[data-position], .dealer-button[data-position]').forEach(element => {
-    positionAtTable(element, Number(element.dataset.position), roomData.max_players, viewerSeat,
-      element.classList.contains('dealer-button'));
+  document.querySelectorAll('.seat[data-position]').forEach(element => {
+    const position = Number(element.dataset.position);
+    positionAtTable(element, position, roomData.max_players, viewerSeat);
+    element.dataset.front = markerSide(position, roomData.max_players, viewerSeat);
   });
 });
