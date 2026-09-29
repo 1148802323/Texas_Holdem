@@ -1066,6 +1066,14 @@ class PokerStore:
             ], "leaderboard": overview["leaderboard"],
         }
 
+    def chat_identity(self, room_id: str, token: str) -> dict:
+        """Read a current room identity without loading or storing chat or cards."""
+        with closing(self._connect()) as conn:
+            room = self._room(conn, room_id)
+            player = self._player(conn, room_id, token)
+            return {"player_id": player["id"], "nickname": player["nickname"],
+                    "open": room["status"] == "open"}
+
     def player_view(self, room_id: str, token: str, hand_id: str | None = None) -> dict:
         with closing(self._connect()) as conn:
             self._room(conn, room_id)

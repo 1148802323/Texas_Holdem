@@ -1,3 +1,5 @@
+import { RoomChat } from './chat.js?v=20260929-chat';
+
 const app = document.querySelector('#app');
 const roomId = location.pathname.startsWith('/r/') ? location.pathname.split('/')[2] : null;
 document.body.classList.toggle('room-view', Boolean(roomId));
@@ -25,6 +27,36 @@ let lastVisualHandId;
 let lastVisualStreet;
 let visualTransitionUntil = 0;
 let openSidebar = null;
+let leftSidebarTab = 'chat';
+const chat = new RoomChat({
+  isVisible: () => leftSidebarTab === 'chat' &&
+    (window.innerWidth > 1400 || openSidebar === 'profit'),
+  onUnreadChange: () => updateChatBadges(),
+  onSend: payload => {
+    if (!socket || socket.readyState !== WebSocket.OPEN) throw new Error('Chat disconnected');
+    socket.send(JSON.stringify(payload));
+  },
+});
+
+function updateChatBadges() {
+  for (const id of ['chat-unread', 'chat-tab-unread']) {
+    const badge = document.getElementById(id);
+    if (badge) { badge.textContent = String(chat.unread); badge.hidden = !chat.unread; }
+  }
+}
+
+function setLeftSidebarTab(name) {
+  leftSidebarTab = name;
+  chat.root.hidden = name !== 'chat';
+  const profit = document.querySelector('#profit-content');
+  if (profit) profit.hidden = name !== 'profit';
+  for (const tab of document.querySelectorAll('[data-left-tab]')) {
+    const selected = tab.dataset.leftTab === name;
+    tab.classList.toggle('active', selected);
+    tab.setAttribute('aria-selected', String(selected));
+  }
+  chat.syncVisibility();
+}
 
 async function loadAudioManifest() {
   try { audioManifest = await api('/api/audio-manifest'); } catch { audioManifest = {}; }
@@ -325,6 +357,7 @@ async function enterRoom() {
     if (error.status === 401) {
       const wasJoined = roomJoined;
       roomJoined = false;
+      chat.reset();
       if (socket) { socket.close(); socket = null; }
       renderJoin(roomData);
       if (wasJoined) notice('此设备的玩家凭证已失效；可以使用管理员提供的恢复码找回原身份。');
@@ -399,11 +432,14 @@ function connectSocket() {
     if (message.type === 'state') {
       renderRoom({ room: message.room, game: message.game });
       refreshHistoryIfNeeded();
-    }
+    } else if (message.type === 'chat_history') chat.receiveHistory(message);
+    else if (message.type === 'chat_message') chat.receiveMessage(message.message);
+    else if (message.type === 'chat_error') chat.showError(message.detail, message.request_id);
   };
   connection.onclose = () => {
     if (socket !== connection) return;
     socket = null;
+    chat.setConnected(false);
     setTimeout(() => { if (roomJoined) enterRoom(); }, 2500);
   };
 }
@@ -458,6 +494,7 @@ function setSidebar(name) {
   }
   const backdrop = document.querySelector('#sidebar-backdrop');
   if (backdrop) backdrop.hidden = !name;
+  chat.syncVisibility();
 }
 
 window.addEventListener('keydown', event => {
@@ -495,13 +532,19 @@ function renderRoom(payload) {
   const settlingTransition = game.street === 'complete' && Date.now() < visualTransitionUntil;
   const previousTableScroll = document.querySelector('.table-scroll')?.scrollLeft;
   const seatedCount = room.players.filter(p => p.seat !== null).length;
+  chat.captureView();
   app.innerHTML = `<section class="hero compact room-heading"><div><div class="eyebrow">PRIVATE TABLE · ${room.room_id.slice(0, 8)}</div><h1>朋友牌局</h1><p>盲注 ${room.small_blind}/${room.big_blind} · 买入上限 ${money(room.max_buyin_stack)} · ${seatedCount}/${room.max_players} 人入座</p></div><div class="room-identity"><span id="identity-name"></span><span id="identity-seat"></span><button id="leave-room" class="btn secondary mini" type="button">退出牌桌</button></div></section>
-    <div class="sidebar-launchers"><button id="profit-toggle" class="btn secondary mini" type="button" aria-controls="profit-panel" aria-expanded="false">◀ 玩家盈亏</button><button id="records-toggle" class="btn secondary mini" type="button" aria-controls="records-panel" aria-expanded="false">我的手牌记录 ▶</button></div>
+    <div class="sidebar-launchers"><button id="profit-toggle" class="btn secondary mini" type="button" aria-controls="profit-panel" aria-expanded="false">◀ 聊天 / 盈亏 <span id="chat-unread" class="chat-unread" hidden></span></button><button id="records-toggle" class="btn secondary mini" type="button" aria-controls="records-panel" aria-expanded="false">我的手牌记录 ▶</button></div>
     <div id="sidebar-backdrop" class="sidebar-backdrop" hidden></div>
-    <div class="room-layout"><aside id="profit-panel" class="panel profit-panel" aria-label="玩家盈亏"><div class="sidebar-heading"><h2>玩家盈亏</h2><button class="sidebar-close btn secondary mini" type="button" aria-label="关闭玩家盈亏侧栏">关闭</button></div><p class="muted small">已结算筹码 − 累计买入；离桌筹码计入兑出。</p><div id="profit-list"></div><div class="rule"></div><h3>旁观者</h3><div id="spectator-list"></div></aside>
+    <div class="room-layout"><aside id="profit-panel" class="panel profit-panel" aria-label="聊天与玩家盈亏"><div class="sidebar-heading"><h2>房间交流</h2><button class="sidebar-close btn secondary mini" type="button" aria-label="关闭聊天与盈亏侧栏">关闭</button></div><div class="tabs chat-tabs" role="tablist" aria-label="左侧栏内容"><button id="chat-tab" class="tab" type="button" role="tab" aria-controls="chat-content" data-left-tab="chat">聊天 <span id="chat-tab-unread" class="chat-unread" hidden></span></button><button class="tab" type="button" role="tab" aria-controls="profit-content" data-left-tab="profit">盈亏</button></div><div id="chat-mount"></div><section id="profit-content" role="tabpanel" aria-label="玩家盈亏"><p class="muted small">已结算筹码 − 累计买入；离桌筹码计入兑出。</p><div id="profit-list"></div><div class="rule"></div><h3>旁观者</h3><div id="spectator-list"></div></section></aside>
     <div class="table-column"><div class="table-scroll"><section class="table-wrap"><div class="table-felt"></div><div class="table-top"><span id="street"></span><span id="turn"></span></div><div class="table-center"><div id="board" class="board"></div><div class="pot">总底池<b id="pot">0</b></div></div><div id="seats" class="seats"></div><div id="deal-transition" class="deal-transition" hidden>发牌中…</div><div id="action-area" class="table-actions"></div></section></div>
     <section class="panel control-panel"><div class="control-header"><div><h2>我的位置与筹码</h2><p id="seat-help" class="muted small"></p></div><div class="stack-number"><span>当前筹码</span><strong id="my-stack"></strong></div></div><div id="seat-controls" class="row"></div><div id="buyin-area"></div></section><section class="panel action-panel"><h2>本手行动</h2><div id="action-history" class="history-list"></div></section></div>
     <aside id="records-panel" class="panel records-panel" aria-label="我的手牌记录"><div class="sidebar-heading"><h2>我的手牌记录</h2><button class="sidebar-close btn secondary mini" type="button" aria-label="关闭手牌记录侧栏">关闭</button></div><button id="history-refresh" class="btn secondary mini" type="button">刷新</button><label class="field">查找手牌<input id="history-search" type="search" placeholder="输入手牌编号或牌面"></label><div id="history-content"><p class="muted small">正在载入你的记录…</p></div></aside></div>`;
+  chat.mount(document.querySelector('#chat-mount'), myId, closed);
+  setLeftSidebarTab(leftSidebarTab);
+  updateChatBadges();
+  document.querySelectorAll('[data-left-tab]').forEach(tab =>
+    tab.addEventListener('click', () => setLeftSidebarTab(tab.dataset.leftTab)));
   setSidebar(openSidebar);
   document.querySelector('#profit-toggle').addEventListener('click', () => setSidebar(openSidebar === 'profit' ? null : 'profit'));
   document.querySelector('#records-toggle').addEventListener('click', () => setSidebar(openSidebar === 'records' ? null : 'records'));
@@ -531,6 +574,7 @@ function renderRoom(payload) {
     try {
       await api(`/api/rooms/${roomId}/leave`, { method: 'POST' });
       roomJoined = false; historyData = null; historyKey = ''; historyViewerId = null;
+      chat.reset();
       if (socket) { socket.close(); socket = null; }
       await enterRoom();
       notice('已退出牌桌。', 'ok');
@@ -912,7 +956,8 @@ else renderHome();
 
 window.addEventListener('resize', () => {
   if (!roomData) return;
-  if (window.innerWidth > 1250 && openSidebar) setSidebar(null);
+  if (window.innerWidth > 1400 && openSidebar) setSidebar(null);
+  chat.syncVisibility();
   const viewerId = currentGame?.viewer_player_id || currentGame?.player_id;
   const viewerSeat = roomData.players.find(player => player.player_id === viewerId)?.seat ?? 0;
   document.querySelectorAll('.seat[data-position]').forEach(element => {

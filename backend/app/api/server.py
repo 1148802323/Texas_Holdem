@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
@@ -97,6 +98,71 @@ class RoomHub:
     def __init__(self, store: PokerStore):
         self.store = store
         self.clients: dict[str, set[tuple[WebSocket, str]]] = {}
+        # Single-process, volatile history. Nothing here is written to PokerStore.
+        self.chat_messages: dict[str, list[dict]] = {}
+        self.chat_requests: dict[str, dict[tuple[str, str], dict]] = {}
+        self.chat_recent: dict[str, dict[str, list[float]]] = {}
+        self.chat_lock = asyncio.Lock()
+
+    async def broadcast_chat(self, room_id: str, payload: dict) -> None:
+        for socket, token in list(self.clients.get(room_id, ())):
+            try:
+                identity = await asyncio.to_thread(self.store.chat_identity, room_id, token)
+                if payload["type"] == "chat_message" and not identity["open"]:
+                    continue
+                await socket.send_json(payload)
+            except Exception:
+                self.clients.get(room_id, set()).discard((socket, token))
+                try:
+                    await socket.close(code=1008)
+                except Exception:
+                    pass
+
+    async def send_chat_history(self, room_id: str, socket: WebSocket, token: str) -> None:
+        async with self.chat_lock:
+            identity = await asyncio.to_thread(self.store.chat_identity, room_id, token)
+            await socket.send_json({"type": "chat_history", "closed": not identity["open"],
+                                    "messages": self.chat_messages.get(room_id, [])
+                                    if identity["open"] else []})
+
+    async def clear_chat(self, room_id: str) -> None:
+        async with self.chat_lock:
+            self.chat_messages.pop(room_id, None)
+            self.chat_requests.pop(room_id, None)
+            self.chat_recent.pop(room_id, None)
+            await self.broadcast_chat(room_id, {"type": "chat_history", "closed": True,
+                                                "messages": []})
+
+    async def send_chat(self, room_id: str, socket: WebSocket, token: str, body: dict) -> None:
+        text, request_id = body.get("text"), body.get("request_id")
+        if not isinstance(text, str) or not text.strip() or len(text) > 200:
+            raise ValueError("消息需为 1–200 字的非空文本。")
+        if not isinstance(request_id, str) or not 1 <= len(request_id) <= 128:
+            raise ValueError("消息请求编号无效。")
+        text = text.strip()
+        async with self.chat_lock:
+            identity = await asyncio.to_thread(self.store.chat_identity, room_id, token)
+            if not identity["open"]:
+                raise Conflict("牌桌已关闭，无法继续聊天。")
+            key = (identity["player_id"], request_id)
+            previous = self.chat_requests.get(room_id, {}).get(key)
+            if previous:
+                if previous["text"] != text:
+                    raise ValueError("同一消息请求编号不能用于不同内容。")
+                await socket.send_json({"type": "chat_message", "message": previous})
+                return
+            now = time.monotonic()
+            recent = [stamp for stamp in self.chat_recent.get(room_id, {}).get(key[0], [])
+                      if now - stamp < 5]
+            if len(recent) >= 3:
+                raise ValueError("发送过于频繁，请稍后再试（每 5 秒最多 3 条）。")
+            message = {"id": secrets.token_hex(16), "request_id": request_id,
+                       "player_id": identity["player_id"], "nickname": identity["nickname"],
+                       "text": text, "sent_at": time.time()}
+            self.chat_recent.setdefault(room_id, {})[key[0]] = recent + [now]
+            self.chat_messages.setdefault(room_id, []).append(message)
+            self.chat_requests.setdefault(room_id, {})[key] = message
+            await self.broadcast_chat(room_id, {"type": "chat_message", "message": message})
 
     async def send_state(self, room_id: str, socket: WebSocket, token: str) -> None:
         room, game = await asyncio.gather(
@@ -282,6 +348,7 @@ def create_app(db_path: str | Path | None = None, admin_password: str | None = N
     @app.delete("/api/admin/rooms/{room_id}", dependencies=[Depends(require_admin)])
     async def delete_room(room_id: str):
         result = await asyncio.to_thread(store.archive_room, room_id)
+        await hub.clear_chat(room_id)
         await hub.broadcast(room_id)
         return result
 
@@ -460,10 +527,28 @@ def create_app(db_path: str | Path | None = None, admin_password: str | None = N
         hub.clients.setdefault(room_id, set()).add(connection)
         try:
             await hub.send_state(room_id, socket, token)
+            await hub.send_chat_history(room_id, socket, token)
             while True:
-                await socket.receive_text()  # actions use the authenticated HTTP endpoint
+                raw = await socket.receive_text()
+                body = None
+                try:
+                    if len(raw) > 4096:
+                        raise ValueError("消息请求过大。")
+                    body = json.loads(raw)
+                    if not isinstance(body, dict) or body.get("type") != "chat_send":
+                        raise ValueError("不支持的消息类型。")
+                    await hub.send_chat(room_id, socket, token, body)
+                except (ValueError, StoreError) as exc:
+                    await socket.send_json({"type": "chat_error", "detail": str(exc),
+                                            "request_id": body.get("request_id")
+                                            if isinstance(body, dict) else None})
+                    if isinstance(exc, AccessDenied):
+                        await socket.close(code=1008)
+                        break
         except WebSocketDisconnect:
             pass
+        except StoreError:
+            await socket.close(code=1008)
         finally:
             hub.clients.get(room_id, set()).discard(connection)
 
