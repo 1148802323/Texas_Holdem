@@ -1,103 +1,62 @@
 # Texas Hold’em 私人牌桌
 
-目标：管理员创建牌局并分享邀请链接，朋友无需注册即可凭昵称加入；支持买入记录、连续手牌、刷新恢复和私密底牌。
+一个供朋友使用的网页版德州扑克项目。房主通过受密码保护的管理页创建牌桌并分享邀请链接；玩家不必注册账号，设置昵称后可先旁观，再选择座位、买入虚拟筹码并参与对局。项目包含独立规则引擎、FastAPI 服务、原生 JavaScript 前端和 SQLite 持久化，目前已部署 [线上牌桌](https://poker.8u7hybby.com)。
 
-开发进度见 [版本推进日志](CHANGELOG.md)。
+当前版本为 **v0.9.0-beta.3**。牌桌支持 2–9 人；真实资金、支付和玩家账号系统均不在当前范围内。
 
-## 当前状态
+## 已实现功能
 
-已具备逐次操作的规则引擎、SQLite 持久化、管理员建房、邀请入座、浏览器牌桌和 WebSocket 同步。单机公网版已部署；服务器配置、首次安装、备份和故障排查见 [部署指南](docs/deployment.md)。
+- **房间与身份**：管理员设置大小盲、座位数、买入后在桌筹码上限、可用昵称及各阶段决策时间，并生成邀请链接。玩家可以旁观、入座、站起换座或退出；昵称与筹码绑定，参与当前手牌时不能换座或离桌。身份由 30 天有效的 HttpOnly Cookie 保存，换设备可使用管理员签发的一次性恢复码。
+- **连续牌局**：入座玩家买入后选择准备；满桌时全员准备即可开局，未满桌时还须全体入座玩家确认。结算后自动开始下一手，直到人数不足或管理员暂停。首手随机抽取庄位，后续按实体座位轮转；管理员可在玩家决策或全下发牌投票期间暂停，恢复后继续剩余时间。
+- **规则与结算**：服务端逐次验证过牌、跟注、下注、加注、弃牌和全下；处理短码盲注、最小加注、短码全下加注权、未跟注筹码返还、边池、平局和筹码守恒。全下后可投票发一次或两次，各底池按有资格争夺该池的玩家分别决定发牌次数。
+- **牌桌体验**：椭圆座位围绕公共牌；每位入座玩家从自己的座位位于下方的视角看牌桌。当前行动者高亮，牌桌显示公开倒计时、百分比和行动按钮；行动最后 5 秒可对本次决策延时一次。提供发牌过渡、可选提示音和动作音效；手机端采用纵向布局。
+- **记录与聊天**：SQLite 保存房间、玩家、买入、手牌及结算数据；左侧可查看昵称盈亏，右侧可查询自己的手牌记录。房间聊天支持入座玩家和旁观者、未读提示与断线重连，但**聊天只在服务进程内存中保存**：删除牌桌或重启服务都会清空，不进入数据库。
+- **管理与安全**：管理员可查看玩家在线状态，签发恢复码、强制离座、移出玩家、暂停或恢复游戏、关闭牌桌。关闭牌桌后停止新玩家加入，并保留数据库中的历史。服务端按玩家身份生成可见状态；他人的未公开底牌和剩余牌堆不会发送到玩家接口。刷新页面可恢复当前身份和手牌进度。
 
-**运行网页牌桌：**按 [网页运行说明](docs/web.md) 设置管理员密码并启动服务，访问 `http://127.0.0.1:8000/admin`。
+## 运行方式
 
-需要重新部署或维护线上服务时，按 [部署指南](docs/deployment.md) 操作；真实密码和数据库文件不在仓库中。
-
-## 目录职责
-
-```text
-backend/
-  app/
-    engine/         卡牌、发牌、牌型评估、下注和结算
-    api/            管理员、房间、买入和历史 HTTP 接口
-    realtime/       实时消息、连接管理和重连同步
-    services/       房间、玩家身份、买入账本等业务
-    models/         数据库模型
-    schemas/        请求、响应及消息数据结构
-    core/           配置、访问控制和数据库连接
-  examples/         本地运行示例
-  tests/
-    engine/         规则和结算测试
-    api/            接口和权限测试
-    integration/    联机、持久化及恢复测试
-frontend/
-  src/
-    pages/
-      admin/        管理员页面
-      join/         邀请和入座页面
-      table/        牌桌页面
-      history/      玩家记录页面
-    components/     公共界面组件
-    services/       API 调用和实时连接
-    styles/         样式
-  public/           静态资源
-database/
-  migrations/       数据库结构迁移；不存放真实数据库和备份
-docs/               需求、设计与原引擎说明
-deploy/             部署配置
-```
-
-空目录使用 `.gitkeep` 保留，实际实现时可以移除占位文件。
-
-## 运行现有演示
-
-使用 Python 3.10 或更高版本，目前仅依赖标准库。在项目根目录运行：
+在项目根目录使用 Python 3.11 或更新版本。以下示例适用于 PowerShell；如使用已有的 `Texas_Holdem` Conda 环境，可把 `python` 换成 `D:\miniconda\envs\Texas_Holdem\python.exe`。
 
 ```powershell
-python -B -X utf8 -m backend.examples.simulate_hand
+python -m pip install -r backend/requirements.txt
+$env:TEXAS_ADMIN_PASSWORD = '请替换成至少 12 位的私密管理密码'
+python -m uvicorn backend.app.api.server:create_app --factory --host 127.0.0.1 --port 8000
 ```
 
-原 `test.py` 是随机策略演示，并非自动化测试，现改名为 `backend/examples/simulate_hand.py`。示例会打印所有玩家底牌，仅用于本地调试，不能直接作为玩家接口或生产日志。
+打开 `http://127.0.0.1:8000/admin`，用管理密码创建房间，再把生成的 `/r/<room_id>` 链接发给朋友。默认数据库是 `database/texas_holdem.sqlite3`，首次启动时自动初始化；可用 `TEXAS_DB_PATH` 指定其他位置。数据库包含未公开手牌，不应放在网页静态目录或提交到 Git。
 
-原说明保存在 [docs/legacy-engine.md](docs/legacy-engine.md)，其中旧路径和启动命令仅作历史参考。
+本机命令只监听 `127.0.0.1`。公网部署需要 HTTPS/WSS、单个 Uvicorn worker、进程服务与数据库备份；服务器配置和逐步操作见 [部署指南](docs/deployment.md)。更完整的玩法、权限和聊天生命周期见 [网页牌桌说明](docs/web.md)。
 
-## 运行规则测试
+## 项目结构
+
+| 路径 | 作用 |
+| --- | --- |
+| [`backend/app/engine/`](backend/app/engine/) | 不依赖 HTTP 或数据库的卡牌、合法操作、状态机、牌型评估与结算 |
+| [`backend/app/services/storage.py`](backend/app/services/storage.py) | SQLite 房间服务、玩家身份、买入、手牌快照、恢复与历史查询 |
+| [`backend/app/api/server.py`](backend/app/api/server.py) | FastAPI 管理与玩家接口、WebSocket 同步、超时处理及内存聊天 |
+| [`frontend/index.html`](frontend/index.html)、[`frontend/src/`](frontend/src/) | 管理页和牌桌入口、原生 JavaScript、聊天、样式和音效 |
+| [`database/migrations/`](database/migrations/) | SQLite 数据库迁移；真实数据库文件不纳入版本管理 |
+| [`backend/tests/`](backend/tests/) | 规则、接口、权限、持久化与部署数据测试 |
+| [`deploy/`](deploy/) | systemd、Caddy 示例和 SQLite 备份／恢复工具 |
+| [`docs/`](docs/) | 网页使用、数据库结构、部署步骤及开发计划 |
+
+游戏状态的来源在服务端：每次行动先校验身份、手牌 ID、状态版本及合法操作，再更新快照和账本，最后通过 WebSocket 向每位玩家发送各自可见的状态。聊天与这些持久化记录分离。数据库表和每手牌的处理流程见 [数据库说明](docs/database.md)。
+
+## 测试与本地演示
+
+安装开发依赖后，在项目根目录运行规则、数据库和 API 回归测试：
 
 ```powershell
-D:\miniconda\envs\Texas_Holdem\python.exe -B -X utf8 -m unittest discover -s backend/tests/engine -v
-D:\miniconda\envs\Texas_Holdem\python.exe -B -X utf8 -m unittest discover -s backend/tests/integration -v
+python -m pip install -r backend/requirements-dev.txt
+python -B -X utf8 -m unittest backend.tests.engine.test_game backend.tests.integration.test_storage backend.tests.integration.test_deploy_data backend.tests.api.test_server
 ```
 
-## 使用引擎
+`backend/examples/simulate_hand.py` 是不连接网页和数据库的本地策略演示，可用 `python -B -X utf8 -m backend.examples.simulate_hand` 运行；它会打印底牌，不能用作线上玩家接口或生产日志。
 
-```python
-from backend.app.engine.actions import Action, ActionType
-from backend.app.engine.game import HoldemGame
-from backend.app.engine.player import Player
+## 下一阶段：GTO 分析与训练题
 
-game = HoldemGame([Player("Alice", 100), Player("Bob", 100)], 1, 2)
-game.start_new_hand()
-seat = game.to_act_index
-player = game.players[seat]
-legal = game.legal_actions(player.player_id)
-game.submit_action(player.player_id, Action(ActionType.CALL), expected_version=game.version)
-player_view = game.state_for_player(player.player_id)
-private_snapshot = game.export_private_snapshot()  # 只供服务端持久化
-```
+1. **先评估服务器容量，再决定模型部署位置**：确定可用的 GTO 模型或求解方案及其许可、支持的局面范围，实测内存、CPU、磁盘占用和响应时间。只有在不影响现有牌局、倒计时和数据库服务的情况下才部署到同一台服务器；资源不足时另选独立算力，不把耗时计算放进游戏请求链路。目前尚未集成 GTO 模型。
+2. **建立独立的分析接口**：把位置、有效筹码、盲注、公共牌和行动历史转换为模型输入，输出适用局面的建议动作、混合频率及可用时的 EV；明确模型无法覆盖的局面。分析服务与现有规则引擎分离，并通过资源限制和超时保护牌局服务。
+3. **加入 GTO 训练题**：从已验证的局面中生成或整理翻前、翻后决策题，展示题目条件和可选动作；玩家提交选择后查看参考频率、解析及错题复盘。训练题与实时牌桌分开，不能读取未结束手牌中其他玩家的私密信息。
 
-`private_snapshot` 包含全部底牌和剩余牌堆，绝不能发送给玩家。房间服务必须串行处理同一桌的命令，并将操作结果与快照一起持久化。行动截止时间由房间服务设置和执行，引擎负责保存该时间。
-
-## 数据库
-
-`PokerStore` 位于 `backend/app/services/storage.py`，负责创建房间、发放玩家凭证、逐笔买入、开始手牌、提交动作、恢复快照及查询个人历史。数据库结构和一致性规则见 [数据库说明](docs/database.md)。房间的买入上限限制买入**之后**的在桌筹码；获胜筹码可以超过上限。
-
-初始化本地数据库：
-
-```powershell
-D:\miniconda\envs\Texas_Holdem\python.exe -B -X utf8 -m backend.examples.init_database
-```
-
-默认生成 `database/texas_holdem.sqlite3`，该文件在 `.gitignore` 中，不会被提交。数据库迁移脚本会随代码进入 Git。已有 `database/holdem.sqlite3` 的环境应在停服后将原文件改名为新文件名，以保留现有牌局数据。
-
-## 下一步
-
-后续功能顺序见 [开发计划](docs/development-plan.md)，已确认范围见 [需求说明](docs/requirements.md)。
+具体里程碑与验收条件见 [开发计划](docs/development-plan.md)。版本变化见 [版本推进日志](CHANGELOG.md)；原控制台规则引擎的历史说明见 [旧版引擎文档](docs/legacy-engine.md)。
