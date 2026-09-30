@@ -23,7 +23,7 @@ $env:TEXAS_ADMIN_PASSWORD = '请替换成至少 12 位的私密管理密码'
 python -m uvicorn backend.app.api.server:create_app --factory --host 127.0.0.1 --port 8000
 ```
 
-打开 `http://127.0.0.1:8000/admin`，用管理密码创建房间，再把生成的 `/r/<room_id>` 链接发给朋友。默认数据库是 `database/texas_holdem.sqlite3`，首次启动时自动初始化；可用 `TEXAS_DB_PATH` 指定其他位置。数据库包含未公开手牌，不应放在网页静态目录或提交到 Git。
+上述命令只监听本机的 127.0.0.1。在运行服务的同一台电脑打开管理页，可创建房间并验证网页功能。要邀请外网朋友游玩，请先将服务部署到可公开访问的服务器，再从公网管理页创建房间并分享公网邀请链接。默认数据库是 `database/texas_holdem.sqlite3`，首次启动时自动初始化；可用 `TEXAS_DB_PATH` 指定其他位置。数据库包含未公开手牌，不应放在网页静态目录或提交到 Git。
 
 本机命令只监听 `127.0.0.1`。公网部署需要 HTTPS/WSS、单个 Uvicorn worker、进程服务与数据库备份；服务器配置和逐步操作见 [部署指南](docs/deployment.md)。更完整的玩法、权限和聊天生命周期见 [网页牌桌说明](docs/web.md)。
 
